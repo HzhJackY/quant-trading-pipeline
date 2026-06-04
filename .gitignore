@@ -14,6 +14,10 @@ dist/
 .vscode/
 .idea/
 
+# Data (cache / generated)
+data/raw/
+data/processed/
+
 # OS
 .DS_Store
 Thumbs.db

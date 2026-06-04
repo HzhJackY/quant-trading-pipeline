@@ -1,6 +1,6 @@
 """
 数据获取模块。
-使用 akshare 获取 A 股日线行情、财务数据、指数成分股。
+使用 akshare 获取 A 股日线行情。
 所有方法内置本地 CSV 缓存, 避免重复请求。
 """
 
@@ -12,26 +12,6 @@ import certifi
 # cert bundle is missing (common on Windows with Python >= 3.13).
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
-
-# Monkey-patch requests so that every request bypasses system proxy settings
-# and uses the certifi CA bundle.  This is required because akshare calls
-# requests.get() internally without the ability to pass custom session
-# configuration.
-import requests as _requests
-import requests.api as _api
-import requests.sessions as _sessions
-
-_original_request = _api.request
-
-
-def _patched_request(method, url, **kwargs):
-    kwargs.setdefault("verify", certifi.where())
-    with _sessions.Session() as session:
-        session.trust_env = False
-        return session.request(method=method, url=url, **kwargs)
-
-
-_api.request = _patched_request
 
 import akshare as ak
 
@@ -82,6 +62,7 @@ class Fetcher:
         start_date: str,
         end_date: str,
         adjust: str = "qfq",
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
         """
         获取个股日线行情。
@@ -96,6 +77,8 @@ class Fetcher:
             结束日期 "YYYYMMDD"
         adjust : str
             复权类型, "qfq"=前复权(默认), "hfq"=后复权, ""=不复权
+        force_refresh : bool
+            当为 True 时跳过缓存, 强制重新请求 (默认 False)
 
         返回
         ----
@@ -107,7 +90,7 @@ class Fetcher:
             self.cache_dir,
             f"daily_{symbol}_{start_date}_{end_date}_{adjust}.csv",
         )
-        if os.path.exists(cache_file):
+        if not force_refresh and os.path.exists(cache_file):
             return pd.read_csv(cache_file, parse_dates=["日期"])
 
         prefixed = self._add_prefix(symbol)
@@ -122,8 +105,9 @@ class Fetcher:
                 end_date=end_date,
                 adjust=adjust,
             )
-        except Exception:
-            pass
+        except (ConnectionError, OSError, ValueError) as e:
+            import warnings
+            warnings.warn(f"Sina source failed for {symbol}, falling back: {e}")
 
         # Fallback to EastMoney source
         if df is None or df.empty:
