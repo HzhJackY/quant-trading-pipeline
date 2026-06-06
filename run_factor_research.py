@@ -127,73 +127,56 @@ def build_panel(f: Fetcher, symbol_list: list[str]) -> pd.DataFrame:
             daily_panel = daily_panel.merge(fdf, on=["date", "symbol"], how="left")
 
     # ── 计算财务因子并合并 ──
+    # THS 数据提供: 净利润, 营业收入, ROE, Debt_Ratio, 每股净资产, 每股收益, 销售净利率
     if fin_rows:
         fin_df = pd.DataFrame(fin_rows)
-        # 统一列名: 股票代码 → symbol, 报告期 → report_date
         fin_df = fin_df.rename(
             columns={"股票代码": "symbol", "报告期": "report_date"}
         )
 
-        # 处理数值类型 (get_financial 返回的可能是字符串)
+        # 处理数值类型
         numeric_cols = [
-            "营业收入", "营业成本", "净利润", "资产总计", "负债合计", "净资产"
+            "净利润", "营业收入", "ROE", "Debt_Ratio", "每股净资产", "每股收益", "销售净利率"
         ]
         for c in numeric_cols:
             if c in fin_df.columns:
                 fin_df[c] = pd.to_numeric(fin_df[c], errors="coerce")
 
-        # ── 添加总市值 (从 akshare 实时行情取, 作为静态近似) ──
-        if "总市值" not in daily_panel.columns:
-            try:
-                spot = ak.stock_zh_a_spot_em()
-                spot["symbol"] = spot["代码"].astype(str).str.zfill(6)
-                mcap_map = spot.set_index("symbol")["总市值"].to_dict()
-                daily_panel["总市值"] = daily_panel["symbol"].map(mcap_map)
-            except Exception:
-                daily_panel["总市值"] = daily_panel["收盘"] * 1e9  # fallback
+        # 按 symbol 取最新一期
+        fin_latest = fin_df.sort_values("report_date").groupby("symbol").last().reset_index()
 
-        # 估值因子 (需要财务 + 总市值)
-        bp = compute_bp(fin_df, daily_panel)
-        ep = compute_ep(fin_df, daily_panel)
-        if not bp.empty:
-            daily_panel = daily_panel.merge(
-                bp[["date", "symbol", "BP"]], on=["date", "symbol"], how="left"
-            )
-        if not ep.empty:
-            daily_panel = daily_panel.merge(
-                ep[["date", "symbol", "EP"]], on=["date", "symbol"], how="left"
-            )
+        # 添加每股市值 (股价作为 proxy) 用于 per-share 估值因子
+        daily_panel["股价"] = daily_panel["收盘"].astype(float)
 
-        # 质量因子 (只需要财务数据, 不用市值)
-        # 每个 symbol 取最新一期财务值, 广播到所有月份
-        for factor_fn, col_name in [
-            (compute_roe, "ROE"),
-            (compute_gross_margin, "Gross_Margin"),
-            (compute_debt_ratio, "Debt_Ratio"),
-        ]:
-            try:
-                fdf = factor_fn(fin_df)
-                if fdf is not None and not fdf.empty and col_name in fdf.columns:
-                    # 取每个 symbol 最新一期的因子值
-                    latest = fdf.sort_values("report_date").groupby("symbol").last()
-                    val_map = latest[col_name].to_dict()
-                    daily_panel[col_name] = daily_panel["symbol"].map(val_map)
-            except Exception:
-                continue
+        # BP = 每股净资产 / 股价
+        if "每股净资产" in fin_latest.columns:
+            bp_map = fin_latest.set_index("symbol")["每股净资产"].to_dict()
+            daily_panel["BP"] = daily_panel["symbol"].map(bp_map) / daily_panel["股价"].replace(0, float("nan"))
 
-        # 成长因子
-        for factor_fn, col_name in [
-            (compute_revenue_growth, "Rev_Growth_YoY"),
-            (compute_earnings_growth, "Earnings_Growth"),
-        ]:
-            try:
-                fdf = factor_fn(fin_df)
-                if fdf is not None and not fdf.empty and col_name in fdf.columns:
-                    latest = fdf.sort_values("report_date").groupby("symbol").last()
-                    val_map = latest[col_name].to_dict()
-                    daily_panel[col_name] = daily_panel["symbol"].map(val_map)
-            except Exception:
-                continue
+        # EP = 每股收益 / 股价
+        if "每股收益" in fin_latest.columns:
+            ep_map = fin_latest.set_index("symbol")["每股收益"].to_dict()
+            daily_panel["EP"] = daily_panel["symbol"].map(ep_map) / daily_panel["股价"].replace(0, float("nan"))
+
+        # ROE (直接从 THS 取, 已是百分比小数)
+        if "ROE" in fin_latest.columns:
+            roe_map = fin_latest.set_index("symbol")["ROE"].to_dict()
+            daily_panel["ROE"] = daily_panel["symbol"].map(roe_map)
+
+        # Debt_Ratio (直接从 THS 取)
+        if "Debt_Ratio" in fin_latest.columns:
+            dr_map = fin_latest.set_index("symbol")["Debt_Ratio"].to_dict()
+            daily_panel["Debt_Ratio"] = daily_panel["symbol"].map(dr_map)
+
+        # 销售净利率 (质量因子)
+        if "销售净利率" in fin_latest.columns:
+            npm_map = fin_latest.set_index("symbol")["销售净利率"].to_dict()
+            daily_panel["Net_Profit_Margin"] = daily_panel["symbol"].map(npm_map)
+
+        # 对数市值
+        daily_panel["log_market_cap"] = np.log(
+            daily_panel["收盘"].astype(float).abs() * 1e8 + 1
+        )
 
     return daily_panel
 
@@ -207,8 +190,7 @@ def preprocess_panel(panel: pd.DataFrame) -> pd.DataFrame:
     factor_cols = [
         "Mom_1M", "Mom_3M", "Mom_6M", "Mom_12M_1M",
         "Vol_20D", "Vol_60D", "Beta",
-        "BP", "EP", "ROE", "Gross_Margin", "Debt_Ratio",
-        "Rev_Growth_YoY", "Earnings_Growth",
+        "BP", "EP", "ROE", "Debt_Ratio", "Net_Profit_Margin",
     ]
     available = [c for c in factor_cols if c in panel.columns]
     print(f"预处理 {len(available)} 个因子: {available}")

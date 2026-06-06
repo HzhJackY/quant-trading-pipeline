@@ -211,8 +211,7 @@ class Fetcher:
         self, symbol: str, report_date: str = None
     ) -> dict:
         """
-        获取个股最新财务数据摘要。
-        返回利润表、资产负债表核心指标。
+        获取个股最新财务数据摘要 (同花顺数据源)。
 
         参数
         ----
@@ -224,78 +223,67 @@ class Fetcher:
         返回
         ----
         dict
-            keys: 营业收入, 营业成本, 净利润, 总资产, 总负债, 净资产, ...
+            keys: 净利润, 营业收入, ROE, Debt_Ratio, 每股净资产, 每股收益, 销售净利率
         """
+        import re
+
         cache_file = os.path.join(
             self.cache_dir,
-            f"financial_{symbol}_{report_date or 'latest'}.csv",
+            f"financial_{symbol}_ths_latest.csv",
         )
         if os.path.exists(cache_file):
             cached = pd.read_csv(cache_file)
             return cached.iloc[0].to_dict() if not cached.empty else {}
 
-        # 获取利润表
         try:
-            profit_df = ak.stock_profit_sheet_by_report_em(symbol=symbol)
+            df = ak.stock_financial_abstract_ths(
+                symbol=symbol, indicator="按报告期"
+            )
         except Exception as e:
-            raise ValueError(f"无法获取 {symbol} 利润表: {e}")
+            raise ValueError(f"无法获取 {symbol} 财务数据: {e}")
 
-        # 获取资产负债表
-        try:
-            balance_df = ak.stock_balance_sheet_by_report_em(symbol=symbol)
-        except Exception:
-            balance_df = None
+        if df.empty:
+            raise ValueError(f"{symbol} 财务数据为空")
 
-        # 提取最新一期的核心指标
-        result = {"股票代码": symbol, "报告期": report_date or "latest"}
+        # 取最新一期
+        latest = df.iloc[-1].copy()
 
-        # 利润表指标: 取第一行(最新报告期)对应数据
-        if profit_df is not None and not profit_df.empty:
-            # akshare 返回的表结构: 第一列是项目名称, 后续列是报告期
-            profit_item_col = profit_df.columns[0]
-            # 取最新报告期列(最后一列, 或指定 report_date)
-            if report_date and report_date in profit_df.columns:
-                val_col = report_date
-            else:
-                val_col = profit_df.columns[-1]
+        def _parse_num(val):
+            """解析带单位的数值: '145.23亿' → 1.4523e10, '3.03%' → 0.0303"""
+            if val is None or (
+                isinstance(val, (int, float)) and pd.isna(val)
+            ):
+                return None
+            s = str(val).strip()
+            if s in ("False", "True", ""):
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                pass
+            # 去除单位
+            if "亿" in s:
+                n = re.sub(r"[^\d.\-]", "", s)
+                return float(n) * 1e8 if n else None
+            elif "万" in s:
+                n = re.sub(r"[^\d.\-]", "", s)
+                return float(n) * 1e4 if n else None
+            elif "%" in s:
+                n = re.sub(r"[^\d.\-]", "", s)
+                return float(n) / 100.0 if n else None
+            return None
 
-            profit_map = profit_df.set_index(profit_item_col)[val_col].to_dict()
-
-            # 核心利润表指标
-            for item in ["营业收入", "营业成本", "净利润", "营业利润"]:
-                result[item] = self._extract_fin_value(profit_map, item)
-
-        # 资产负债表指标
-        if balance_df is not None and not balance_df.empty:
-            bs_item_col = balance_df.columns[0]
-            if report_date and report_date in balance_df.columns:
-                val_col = report_date
-            else:
-                val_col = balance_df.columns[-1]
-
-            bs_map = balance_df.set_index(bs_item_col)[val_col].to_dict()
-
-            for item in ["资产总计", "负债合计", "归属于母公司股东权益合计"]:
-                result[item] = self._extract_fin_value(bs_map, item)
-
-        # 派生指标
-        total_assets = result.get("资产总计", 0) or 0
-        total_liabilities = result.get("负债合计", 0) or 0
-        result["净资产"] = total_assets - total_liabilities
-
-        pd.DataFrame([result]).to_csv(cache_file, index=False)
-        return result
-
-    @staticmethod
-    def _extract_fin_value(fin_map: dict, keyword: str) -> float | None:
-        """从财务字典中模糊匹配数值. akshare 的项目名称可能不完全一致."""
-        for key, value in fin_map.items():
-            if isinstance(key, str) and keyword in key:
-                try:
-                    return float(value) if value else None
-                except (ValueError, TypeError):
-                    return None
-        return None
+        return {
+            "股票代码": symbol,
+            "报告期": str(latest.get("报告期", "")),
+            "净利润": _parse_num(latest.get("净利润")),
+            "营业收入": _parse_num(latest.get("营业总收入")),
+            "ROE": _parse_num(latest.get("净资产收益率")),
+            "Debt_Ratio": _parse_num(latest.get("资产负债率")),
+            "每股净资产": _parse_num(latest.get("每股净资产")),
+            "每股收益": _parse_num(latest.get("基本每股收益")),
+            "销售净利率": _parse_num(latest.get("销售净利率")),
+        }
 
     def get_financial_bulk(
         self, symbols: list[str], report_date: str = None
