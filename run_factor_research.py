@@ -179,11 +179,7 @@ def preprocess_panel(panel: pd.DataFrame) -> pd.DataFrame:
         panel[col] = panel.groupby("date")[col].transform(
             lambda x: winsorize_mad(x, n_mad=3.0)
         )
-        # 标准化
-        panel = standardize_cross_section(panel, factor_col=col, date_col="date")
-        # 重命名: col → col_z
-        panel = panel.rename(columns={f"{col}_z": col})
-        # 重新标准化一次以得到最终 z 值
+        # 标准化 (生成 {col}_z 列, 保留原值)
         panel = standardize_cross_section(panel, factor_col=col, date_col="date")
 
     return panel
