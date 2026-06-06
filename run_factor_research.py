@@ -129,32 +129,71 @@ def build_panel(f: Fetcher, symbol_list: list[str]) -> pd.DataFrame:
     # ── 计算财务因子并合并 ──
     if fin_rows:
         fin_df = pd.DataFrame(fin_rows)
-        fin_df = fin_df.rename(columns={"报告期": "report_date"})
+        # 统一列名: 股票代码 → symbol, 报告期 → report_date
+        fin_df = fin_df.rename(
+            columns={"股票代码": "symbol", "报告期": "report_date"}
+        )
 
-        # 估值因子需要财务 + 市值
+        # 处理数值类型 (get_financial 返回的可能是字符串)
+        numeric_cols = [
+            "营业收入", "营业成本", "净利润", "资产总计", "负债合计", "净资产"
+        ]
+        for c in numeric_cols:
+            if c in fin_df.columns:
+                fin_df[c] = pd.to_numeric(fin_df[c], errors="coerce")
+
+        # ── 添加总市值 (从 akshare 实时行情取, 作为静态近似) ──
+        if "总市值" not in daily_panel.columns:
+            try:
+                spot = ak.stock_zh_a_spot_em()
+                spot["symbol"] = spot["代码"].astype(str).str.zfill(6)
+                mcap_map = spot.set_index("symbol")["总市值"].to_dict()
+                daily_panel["总市值"] = daily_panel["symbol"].map(mcap_map)
+            except Exception:
+                daily_panel["总市值"] = daily_panel["收盘"] * 1e9  # fallback
+
+        # 估值因子 (需要财务 + 总市值)
         bp = compute_bp(fin_df, daily_panel)
         ep = compute_ep(fin_df, daily_panel)
         if not bp.empty:
-            daily_panel = daily_panel.merge(bp, on=["date", "symbol"], how="left")
+            daily_panel = daily_panel.merge(
+                bp[["date", "symbol", "BP"]], on=["date", "symbol"], how="left"
+            )
         if not ep.empty:
-            daily_panel = daily_panel.merge(ep, on=["date", "symbol"], how="left")
+            daily_panel = daily_panel.merge(
+                ep[["date", "symbol", "EP"]], on=["date", "symbol"], how="left"
+            )
 
-        roe = compute_roe(fin_df)
-        gm = compute_gross_margin(fin_df)
-        dr = compute_debt_ratio(fin_df)
-        for fdf in [roe, gm, dr]:
-            if fdf is not None and not fdf.empty:
-                daily_panel = daily_panel.merge(
-                    fdf, left_on="symbol", right_on="symbol", how="left"
-                )
+        # 质量因子 (只需要财务数据, 不用市值)
+        # 每个 symbol 取最新一期财务值, 广播到所有月份
+        for factor_fn, col_name in [
+            (compute_roe, "ROE"),
+            (compute_gross_margin, "Gross_Margin"),
+            (compute_debt_ratio, "Debt_Ratio"),
+        ]:
+            try:
+                fdf = factor_fn(fin_df)
+                if fdf is not None and not fdf.empty and col_name in fdf.columns:
+                    # 取每个 symbol 最新一期的因子值
+                    latest = fdf.sort_values("report_date").groupby("symbol").last()
+                    val_map = latest[col_name].to_dict()
+                    daily_panel[col_name] = daily_panel["symbol"].map(val_map)
+            except Exception:
+                continue
 
-        rev_g = compute_revenue_growth(fin_df)
-        earn_g = compute_earnings_growth(fin_df)
-        for fdf in [rev_g, earn_g]:
-            if fdf is not None and not fdf.empty:
-                daily_panel = daily_panel.merge(
-                    fdf, left_on="symbol", right_on="symbol", how="left"
-                )
+        # 成长因子
+        for factor_fn, col_name in [
+            (compute_revenue_growth, "Rev_Growth_YoY"),
+            (compute_earnings_growth, "Earnings_Growth"),
+        ]:
+            try:
+                fdf = factor_fn(fin_df)
+                if fdf is not None and not fdf.empty and col_name in fdf.columns:
+                    latest = fdf.sort_values("report_date").groupby("symbol").last()
+                    val_map = latest[col_name].to_dict()
+                    daily_panel[col_name] = daily_panel["symbol"].map(val_map)
+            except Exception:
+                continue
 
     return daily_panel
 
@@ -195,9 +234,10 @@ def run_analysis(panel: pd.DataFrame):
     """
     # 构造下期收益 (forward return)
     panel = panel.sort_values(["symbol", "date"]).copy()
-    panel["close"] = panel.groupby("symbol")["收盘"].shift(0)
+    # 每只股票的下个月收盘价
+    panel["prev_close"] = panel.groupby("symbol")["收盘"].shift(0)
     panel["next_close"] = panel.groupby("symbol")["收盘"].shift(-1)
-    panel["forward_return_1m"] = panel["next_close"] / panel["收盘"] - 1
+    panel["forward_return_1m"] = (panel["next_close"] - panel["prev_close"]) / panel["prev_close"]
     panel = panel.dropna(subset=["forward_return_1m"])
 
     # ── IC 分析 ──
