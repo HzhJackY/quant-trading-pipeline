@@ -50,7 +50,7 @@ def assign_quantile_groups(
         except ValueError:
             df.loc[mask, "group"] = 1
 
-    df["group"] = df["group"].astype(int)
+    df["group"] = df["group"].astype("Int64")  # nullable int, 容忍 NaN
     return df
 
 
