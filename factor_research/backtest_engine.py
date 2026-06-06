@@ -15,36 +15,138 @@ def combine_factors(
     factor_df: pd.DataFrame,
     factor_cols: list[str] | None = None,
     method: str = "equal_weight",
+    return_col: str = "forward_return_1m",
+    date_col: str = "date",
+    max_correlation: float = 0.7,
+    flip_sign: bool = True,
 ) -> pd.DataFrame:
     """
     多因子合成: 将多个标准化后的因子合并成一个复合分数。
 
     方法:
-    - equal_weight: 每个因子贡献一样 (稳健,不overfit)
-    - ic_weighted: 用历史 IC_IR 加权 (但需要足够长的历史, 否则 overfit)
+    - equal_weight: 每个因子贡献一样 (稳健, 不overfit)
+    - ic_weighted: 用每个因子的 |IC_IR| 加权
 
-    等权是最简单也最常用的——当你不知道哪个因子未来表现更好,
-    给每个因子一样的权重就是最诚实的选择。
+    可选优化:
+    - flip_sign=True: 自动翻转 IC 稳定为负的因子 (反转因子)
+    - max_correlation: 去冗余阈值 — 当两个因子相关性超过此值时,
+      只保留 |IC_IR| 更高的那个, 避免重复计算同一信号
     """
+    from scipy.stats import spearmanr
+
     df = factor_df.copy()
     if factor_cols is None:
-        # 自动检测因子列 (带 _z 或 _neutral 后缀的)
         factor_cols = [
-            c
-            for c in df.columns
+            c for c in df.columns
             if c.endswith("_z") or c.endswith("_neutral")
         ]
     if not factor_cols:
-        # fallback 到所有数值列
         factor_cols = [
-            c
-            for c in df.columns
+            c for c in df.columns
             if c not in ("date", "symbol", "group")
             and pd.api.types.is_numeric_dtype(df[c])
         ]
 
     available = [c for c in factor_cols if c in df.columns]
-    df["composite_factor"] = df[available].mean(axis=1, skipna=True)
+    if not available:
+        df["composite_factor"] = 0.0
+        return df
+
+    # ── Step 1: 计算每个因子在全样本上的 IC_IR ──
+    has_returns = return_col in df.columns
+    ic_irs = {}
+    factor_signs = {}  # +1 或 -1
+    factor_corrs = None
+
+    if has_returns:
+        for col in available:
+            ic_list = []
+            for dt, grp in df.groupby(date_col):
+                sub = grp[[col, return_col]].dropna()
+                if len(sub) >= 20:
+                    try:
+                        ic, _ = spearmanr(sub[col], sub[return_col])
+                        if not np.isnan(ic):
+                            ic_list.append(ic)
+                    except Exception:
+                        pass
+            if ic_list:
+                mean_ic = np.mean(ic_list)
+                std_ic = np.std(ic_list, ddof=1)
+                ic_irs[col] = mean_ic / std_ic if std_ic > 0 else 0.0
+            else:
+                ic_irs[col] = 0.0
+
+        # ── 计算因子截面相关性矩阵 (用于去冗余) ──
+        latest_date = df[date_col].max()
+        sub_latest = df[df[date_col] == latest_date][available].dropna()
+        if len(sub_latest) > 10:
+            factor_corrs = sub_latest.corr()
+
+    # 如果没有 forward returns, 所有因子等权
+    if not ic_irs:
+        df["composite_factor"] = df[available].mean(axis=1, skipna=True)
+        return df
+
+    # ── Step 2: 符号翻转 ──
+    selected = {}  # col -> (sign, weight)
+    for col in available:
+        ic_ir = ic_irs.get(col, 0.0)
+        if flip_sign and ic_ir < 0:
+            selected[col] = (-1.0, abs(ic_ir))  # 翻转为正贡献
+        else:
+            selected[col] = (1.0, abs(ic_ir))
+
+    # ── Step 3: 去冗余 (相关性 > max_correlation 只保留 |IC_IR| 更高的) ──
+    if factor_corrs is not None and max_correlation < 1.0:
+        # 按 |IC_IR| 降序排列
+        sorted_factors = sorted(selected.keys(), key=lambda c: selected[c][1], reverse=True)
+        kept = []
+        for col in sorted_factors:
+            too_similar = False
+            for kept_col in kept:
+                if col in factor_corrs.index and kept_col in factor_corrs.columns:
+                    corr_val = abs(factor_corrs.loc[col, kept_col])
+                    if corr_val > max_correlation:
+                        too_similar = True
+                        break
+            if not too_similar:
+                kept.append(col)
+
+        removed_count = len(selected) - len(kept)
+        if removed_count > 0:
+            print(f"  去冗余: 移除 {removed_count} 个高相关因子, "
+                  f"保留 {len(kept)} 个 (阈值={max_correlation})")
+        selected = {k: selected[k] for k in kept}
+    else:
+        kept = list(selected.keys())
+
+    # ── Step 4: 计算权重 ──
+    if method == "ic_weighted":
+        total_weight = sum(selected[c][1] for c in selected)
+        if total_weight > 0:
+            weights = {c: selected[c][1] / total_weight for c in selected}
+        else:
+            weights = {c: 1.0 / len(selected) for c in selected}
+    else:
+        # equal_weight
+        weights = {c: 1.0 / len(selected) for c in selected}
+
+    # ── Step 5: 合成 ──
+    df["composite_factor"] = 0.0
+    for col in selected:
+        sign = selected[col][0]
+        w = weights[col]
+        col_data = df[col].fillna(0.0)
+        df["composite_factor"] += sign * w * col_data
+
+    # 打印合成信息
+    print(f"  合成方法: {method} | 翻转符号: {flip_sign} | 去冗余: {max_correlation}")
+    print(f"  因子权重:")
+    for col in sorted(selected.keys(), key=lambda c: weights[c], reverse=True):
+        sign_str = " (-)" if selected[col][0] < 0 else " (+)"
+        print(f"    {col}: {weights[col]:.3f}{sign_str}  (|IC_IR|={selected[col][1]:.4f})")
+
     return df
 
 

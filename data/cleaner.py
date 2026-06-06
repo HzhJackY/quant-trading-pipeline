@@ -75,7 +75,7 @@ def neutralize_industry_market_cap(
 ) -> pd.DataFrame:
     """
     行业 + 市值中性化。
-    对每个截面, 将因子对行业虚拟变量和对数市值做 OLS 回归, 取残差。
+    对每个截面, 将因子对行业虚拟变量和(可选的)对数市值做 OLS 回归, 取残差。
 
     为什么要做中性化:
     - 假设你发现了一个"高 ROE 股票收益好"的信号
@@ -90,12 +90,18 @@ def neutralize_industry_market_cap(
     残差的经济含义: "这只股票的因子值, 在扣除了它的行业和市值应有的水平后,
     还剩下多少超额部分?" 这才是因子的纯 alpha。
 
+    如果 mcap_col 在 DataFrame 中不存在, 只做行业中性化。
+
     返回的 DataFrame 新增一列 {factor_col}_neutral。
     """
     from statsmodels.api import OLS, add_constant
 
     df = df.copy()
     residual_list = []
+
+    has_mcap = mcap_col in df.columns
+    if not has_mcap:
+        print(f"  [中性化] 未找到市值列 '{mcap_col}', 仅做行业中性化")
 
     for date, group in df.groupby(date_col):
         if len(group) < 10 or group[factor_col].nunique() < 2:
@@ -109,8 +115,11 @@ def neutralize_industry_market_cap(
             group[industry_col], drop_first=True
         ).astype(float)
 
-        # 回归自变量: const + 行业哑变量 + 对数市值
-        X = pd.concat([industry_dummies, group[mcap_col].astype(float)], axis=1)
+        # 回归自变量: const + 行业哑变量 + (可选) 对数市值
+        if has_mcap:
+            X = pd.concat([industry_dummies, group[mcap_col].astype(float)], axis=1)
+        else:
+            X = industry_dummies
         X = add_constant(X, has_constant="add")
         y = group[factor_col].astype(float)
 

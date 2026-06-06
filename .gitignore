@@ -18,6 +18,12 @@ dist/
 data/raw/
 data/processed/
 
+# Pipeline output (large / reproducible)
+output/*.parquet
+output/*.csv
+output/*.png
+.pipeline_state.json
+
 # OS
 .DS_Store
 Thumbs.db

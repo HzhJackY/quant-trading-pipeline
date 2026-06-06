@@ -204,6 +204,9 @@ class Fetcher:
         )
         codes = [c for c in codes if c.isdigit() and len(c) == 6]
 
+        # 去重: CSI 800 等指数可能同一只股票出现多次 (如不同交易所份额)
+        codes = list(dict.fromkeys(codes))  # 保序去重
+
         pd.DataFrame({"code": codes}).to_csv(cache_file, index=False)
         return codes
 
@@ -232,7 +235,7 @@ class Fetcher:
             f"financial_{symbol}_ths_latest.csv",
         )
         if os.path.exists(cache_file):
-            cached = pd.read_csv(cache_file)
+            cached = pd.read_csv(cache_file, dtype={"股票代码": str})
             return cached.iloc[0].to_dict() if not cached.empty else {}
 
         try:
@@ -273,7 +276,7 @@ class Fetcher:
                 return float(n) / 100.0 if n else None
             return None
 
-        return {
+        result = {
             "股票代码": symbol,
             "报告期": str(latest.get("报告期", "")),
             "净利润": _parse_num(latest.get("净利润")),
@@ -284,6 +287,98 @@ class Fetcher:
             "每股收益": _parse_num(latest.get("基本每股收益")),
             "销售净利率": _parse_num(latest.get("销售净利率")),
         }
+
+        # 写入缓存
+        pd.DataFrame([result]).to_csv(cache_file, index=False)
+
+        return result
+
+    def get_financial_history(self, symbol: str) -> "pd.DataFrame":
+        """
+        获取个股全部历史财务数据 (Point-in-Time 对齐用)。
+
+        与 get_financial 不同, 此方法返回所有报告期的完整历史,
+        而非仅最新一期。配合 pd.merge_asof 实现 PIT 财务数据对齐。
+
+        参数
+        ----
+        symbol : str
+            股票代码, 如 "000001"
+
+        返回
+        ----
+        pd.DataFrame
+            列: symbol, report_date, 净利润, 营业收入, ROE,
+                 Debt_Ratio, 每股净资产, 每股收益, 销售净利率
+        """
+        import re
+
+        cache_file = os.path.join(
+            self.cache_dir,
+            f"financial_{symbol}_ths_history.csv",
+        )
+        if os.path.exists(cache_file):
+            cached = pd.read_csv(
+                cache_file,
+                dtype={"symbol": str},
+                parse_dates=["report_date"],
+            )
+            return cached
+
+        try:
+            df = ak.stock_financial_abstract_ths(
+                symbol=symbol, indicator="按报告期"
+            )
+        except Exception as e:
+            raise ValueError(f"无法获取 {symbol} 财务历史: {e}")
+
+        if df.empty:
+            raise ValueError(f"{symbol} 财务历史为空")
+
+        def _parse_num(val):
+            """解析带单位的数值, 同 get_financial 中的逻辑。"""
+            if val is None or (
+                isinstance(val, (int, float)) and pd.isna(val)
+            ):
+                return None
+            s = str(val).strip()
+            if s in ("False", "True", ""):
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                pass
+            if "亿" in s:
+                n = re.sub(r"[^\d.\-]", "", s)
+                return float(n) * 1e8 if n else None
+            elif "万" in s:
+                n = re.sub(r"[^\d.\-]", "", s)
+                return float(n) * 1e4 if n else None
+            elif "%" in s:
+                n = re.sub(r"[^\d.\-]", "", s)
+                return float(n) / 100.0 if n else None
+            return None
+
+        # 构建输出 DataFrame
+        result = pd.DataFrame({
+            "symbol": symbol,
+            "report_date": pd.to_datetime(
+                df["报告期"], errors="coerce"
+            ),
+            "净利润": df["净利润"].apply(_parse_num),
+            "营业收入": df.get("营业总收入", df.get("营业收入")).apply(_parse_num),
+            "ROE": df["净资产收益率"].apply(_parse_num),
+            "Debt_Ratio": df["资产负债率"].apply(_parse_num),
+            "每股净资产": df["每股净资产"].apply(_parse_num),
+            "每股收益": df["基本每股收益"].apply(_parse_num),
+            "销售净利率": df["销售净利率"].apply(_parse_num),
+        })
+
+        # 删除 report_date 为空的行
+        result = result.dropna(subset=["report_date"])
+
+        result.to_csv(cache_file, index=False)
+        return result
 
     def get_financial_bulk(
         self, symbols: list[str], report_date: str = None
