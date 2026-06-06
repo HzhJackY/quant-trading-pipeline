@@ -154,3 +154,167 @@ class Fetcher:
 
         df.to_csv(cache_file, index=False)
         return df
+
+    def get_index_members(self, index_code: str) -> list[str]:
+        """
+        获取指数成分股列表。
+
+        参数
+        ----
+        index_code : str
+            指数代码, 如 "000300"(沪深300), "000905"(中证500),
+            "000906"(中证800), "000016"(上证50)
+
+        返回
+        ----
+        list[str]
+            成分股代码列表, 如 ["000001", "000002", ...]
+        """
+        cache_file = os.path.join(
+            self.cache_dir, f"index_members_{index_code}.csv"
+        )
+        if os.path.exists(cache_file):
+            df = pd.read_csv(cache_file, dtype={"code": str})
+            return df["code"].tolist()
+
+        try:
+            df = ak.index_stock_cons(index_code)
+        except Exception:
+            raise ValueError(f"无法获取指数成分股: {index_code}")
+
+        if df.empty:
+            raise ValueError(f"指数 {index_code} 成分股数据为空")
+
+        # 中证指数成分股 API 返回英文列名 "品种代码", "品种名称" 等
+        # 不同指数源可能不同, 取第一列数字型代码
+        code_col = None
+        for col in df.columns:
+            col_low = col.lower()
+            if any(kw in col_low for kw in ["代码", "code", "symbol", "品种"]):
+                code_col = col
+                break
+        if code_col is None:
+            code_col = df.columns[0]
+
+        codes = (
+            df[code_col]
+            .astype(str)
+            .str.replace(r"[^0-9]", "", regex=True)
+            .str[-6:]  # 取后6位纯数字, 舍弃交易所前缀
+        )
+        codes = [c for c in codes if c.isdigit() and len(c) == 6]
+
+        pd.DataFrame({"code": codes}).to_csv(cache_file, index=False)
+        return codes
+
+    def get_financial(
+        self, symbol: str, report_date: str = None
+    ) -> dict:
+        """
+        获取个股最新财务数据摘要。
+        返回利润表、资产负债表核心指标。
+
+        参数
+        ----
+        symbol : str
+            股票代码, 如 "000001"
+        report_date : str | None
+            报告期, 如 "20231231"。为 None 时取最新一期
+
+        返回
+        ----
+        dict
+            keys: 营业收入, 营业成本, 净利润, 总资产, 总负债, 净资产, ...
+        """
+        cache_file = os.path.join(
+            self.cache_dir,
+            f"financial_{symbol}_{report_date or 'latest'}.csv",
+        )
+        if os.path.exists(cache_file):
+            cached = pd.read_csv(cache_file)
+            return cached.iloc[0].to_dict() if not cached.empty else {}
+
+        # 获取利润表
+        try:
+            profit_df = ak.stock_profit_sheet_by_report_em(symbol=symbol)
+        except Exception as e:
+            raise ValueError(f"无法获取 {symbol} 利润表: {e}")
+
+        # 获取资产负债表
+        try:
+            balance_df = ak.stock_balance_sheet_by_report_em(symbol=symbol)
+        except Exception:
+            balance_df = None
+
+        # 提取最新一期的核心指标
+        result = {"股票代码": symbol, "报告期": report_date or "latest"}
+
+        # 利润表指标: 取第一行(最新报告期)对应数据
+        if profit_df is not None and not profit_df.empty:
+            # akshare 返回的表结构: 第一列是项目名称, 后续列是报告期
+            profit_item_col = profit_df.columns[0]
+            # 取最新报告期列(最后一列, 或指定 report_date)
+            if report_date and report_date in profit_df.columns:
+                val_col = report_date
+            else:
+                val_col = profit_df.columns[-1]
+
+            profit_map = profit_df.set_index(profit_item_col)[val_col].to_dict()
+
+            # 核心利润表指标
+            for item in ["营业收入", "营业成本", "净利润", "营业利润"]:
+                result[item] = self._extract_fin_value(profit_map, item)
+
+        # 资产负债表指标
+        if balance_df is not None and not balance_df.empty:
+            bs_item_col = balance_df.columns[0]
+            if report_date and report_date in balance_df.columns:
+                val_col = report_date
+            else:
+                val_col = balance_df.columns[-1]
+
+            bs_map = balance_df.set_index(bs_item_col)[val_col].to_dict()
+
+            for item in ["资产总计", "负债合计", "归属于母公司股东权益合计"]:
+                result[item] = self._extract_fin_value(bs_map, item)
+
+        # 派生指标
+        total_assets = result.get("资产总计", 0) or 0
+        total_liabilities = result.get("负债合计", 0) or 0
+        result["净资产"] = total_assets - total_liabilities
+
+        pd.DataFrame([result]).to_csv(cache_file, index=False)
+        return result
+
+    @staticmethod
+    def _extract_fin_value(fin_map: dict, keyword: str) -> float | None:
+        """从财务字典中模糊匹配数值. akshare 的项目名称可能不完全一致."""
+        for key, value in fin_map.items():
+            if isinstance(key, str) and keyword in key:
+                try:
+                    return float(value) if value else None
+                except (ValueError, TypeError):
+                    return None
+        return None
+
+    def get_financial_bulk(
+        self, symbols: list[str], report_date: str = None
+    ) -> "pd.DataFrame":
+        """
+        批量获取多只股票的财务数据。
+
+        返回
+        ----
+        pd.DataFrame
+            每行一只股票, 列为财务指标
+        """
+        from tqdm import tqdm
+
+        rows = []
+        for sym in tqdm(symbols, desc="获取财务数据"):
+            try:
+                fin = self.get_financial(sym, report_date)
+                rows.append(fin)
+            except Exception:
+                continue
+        return pd.DataFrame(rows)
