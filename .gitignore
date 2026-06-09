@@ -42,3 +42,4 @@ init_local_state.bat
 
 # Claude internal
 .claude/
+resume/ 
