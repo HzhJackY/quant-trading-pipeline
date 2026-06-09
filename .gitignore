@@ -28,5 +28,17 @@ output/*.png
 .DS_Store
 Thumbs.db
 
+# Error logs
+data/error_log.txt
+
+# Paper trading runtime (SQLite DB + cached parquet)
+output/paper_trading_db/
+
+# Production models (large binary artifacts)
+output/production_models/
+
+# Local environment scripts
+init_local_state.bat
+
 # Claude internal
 .claude/
