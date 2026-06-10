@@ -1,8 +1,17 @@
 """
-每日持仓监控看板 — Streamlit Dashboard for Top 30 Portfolio Monitoring.
+每日持仓监控看板 v2 — 机构级风险与收益归因 Dashboard.
 
-在每日盘后（18:00 之后）运行，监控 Top 30 实盘组合的单日表现。
-数据源: output/paper_trading_db/state.db (持仓) + baostock (行情)
+在每日盘后（18:00 之后）运行，监控 Top 30 实盘组合的表现、风格暴露与风险事件。
+
+三个核心增强模块:
+  1. 历史超额走势图  — 持有期累计净值 (组合 / 基准 / Alpha)
+  2. 风格因子暴露度  — Size, Momentum, Value, Volatility 横截面暴露
+  3. 异常风控雷达    — 暴跌 (-7%) / ST / 停牌 风险扫描
+
+数据源:
+  - output/paper_trading_db/state.db  — 持仓 (signal_anchor) + 日线缓存 (market_cache)
+  - output/paper_trading_db/fundamentals_*.parquet — 基本面 (市值/估值/行业)
+  - baostock — 实时行情 + 基准历史
 
 用法:
     streamlit run monitoring/daily_report.py
@@ -21,7 +30,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# 确保项目根目录在 path 上（供 baostock adapter 等模块引用）
+# 确保项目根目录在 path 上
 _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
@@ -29,20 +38,39 @@ if str(_project_root) not in sys.path:
 import baostock as bs
 
 # ═══════════════════════════════════════════════════════════
-# 配置常量
+# 全局配置
 # ═══════════════════════════════════════════════════════════
 
 DEFAULT_DB_PATH = _project_root / "output" / "paper_trading_db" / "state.db"
-BENCHMARK_BS_CODE = "sh.000905"   # Baostock 格式的中证500
-BENCHMARK_SYMBOL = "000905"       # 内部 6 位代码
+DEFAULT_DB_DIR  = _project_root / "output" / "paper_trading_db"
+BENCHMARK_BS_CODE = "sh.000905"
+BENCHMARK_SYMBOL = "000905"
 TOP_N = 30
 
-# Streamlit 页面配置（必须在所有 st 调用之前）
+# 风控阈值
+DRAWDOWN_ALERT_THRESHOLD = -0.07   # 单日跌幅超过 -7% 触发预警
+LARGE_CAP_MCAP_THRESHOLD = 2e10    # 200 亿 — 大盘/小盘分界参考
+
 st.set_page_config(
-    page_title="Top 30 量化组合每日监控",
+    page_title="Top 30 量化组合 · 风控看板",
     page_icon="📊",
     layout="wide",
 )
+
+# ── 自定义 CSS（微调视觉）──
+st.markdown("""
+<style>
+    /* 指标卡片轻微放大 */
+    [data-testid="stMetricValue"] {
+        font-size: 1.6rem;
+    }
+    /* 风险警告区域 */
+    .risk-alert {
+        border-left: 4px solid #ef4444;
+        padding-left: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -50,92 +78,126 @@ st.set_page_config(
 # ═══════════════════════════════════════════════════════════
 
 def _to_bs_code(symbol: str) -> str:
-    """将 6 位 A 股代码转为 Baostock 格式 (sh.600000 / sz.000001)。"""
+    """6 位 A 股代码 → Baostock 格式 (sh.600000 / sz.000001)."""
     code = str(symbol).zfill(6)
     if code.startswith(("6", "9")):
         return f"sh.{code}"
-    else:
-        return f"sz.{code}"
+    return f"sz.{code}"
+
+
+def _find_latest_parquet(prefix: str, db_dir: Path = DEFAULT_DB_DIR) -> Optional[Path]:
+    """查找 db_dir 下最新的匹配前缀的 parquet 文件。"""
+    candidates = sorted(db_dir.glob(f"{prefix}*.parquet"), reverse=True)
+    return candidates[0] if candidates else None
 
 
 # ═══════════════════════════════════════════════════════════
-# 数据获取层 — SQLite 持仓
+# Section 1 — SQLite 数据层
 # ═══════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_latest_positions(
-    db_path: Path, top_n: int = TOP_N
-) -> Tuple[Optional[str], pd.DataFrame]:
+def load_positions(db_path: Path, top_n: int = TOP_N) -> Tuple[Optional[str], pd.DataFrame]:
     """
-    从 signal_anchor 表中获取最新调仓期的 Top N 持仓。
-
-    逻辑：
-      - 查询 signal_anchor 中最大的 ym（调仓月份）
-      - 取出该月 alpha_signal 最高的 top_n 只股票
-      - 返回持仓明细 DataFrame
-
-    Args:
-        db_path: state.db 文件的路径。
-        top_n:  取前 N 只股票（默认 30）。
+    从 signal_anchor 获取最新调仓期的 Top N 持仓.
 
     Returns:
-        (ym, positions_df) —
-        - ym:          "YYYY-MM" 格式的调仓月份，无数据时为 None
-        - positions_df: columns = [symbol, alpha_signal]，按 signal 降序排列
+        (ym, df) — ym: "YYYY-MM", df: [symbol, alpha_signal] 按 signal 降序.
     """
     if not db_path.exists():
         return None, pd.DataFrame(columns=["symbol", "alpha_signal"])
 
     conn = sqlite3.connect(str(db_path))
     try:
-        # ── 获取最新调仓月份 ──
         row = conn.execute("SELECT MAX(ym) FROM signal_anchor").fetchone()
         if not row or not row[0]:
             return None, pd.DataFrame(columns=["symbol", "alpha_signal"])
-
         latest_ym = row[0]
-
-        # ── 获取该月的 Top N 持仓（按 alpha_signal 降序）──
-        query = """
-            SELECT symbol, alpha_signal
-            FROM signal_anchor
-            WHERE ym = ?
-            ORDER BY alpha_signal DESC
-            LIMIT ?
-        """
-        rows = conn.execute(query, (latest_ym, top_n)).fetchall()
-
-        if not rows:
-            return latest_ym, pd.DataFrame(columns=["symbol", "alpha_signal"])
-
-        df = pd.DataFrame(rows, columns=["symbol", "alpha_signal"])
+        rows = conn.execute(
+            "SELECT symbol, alpha_signal FROM signal_anchor WHERE ym=? "
+            "ORDER BY alpha_signal DESC LIMIT ?",
+            (latest_ym, top_n),
+        ).fetchall()
+        df = pd.DataFrame(rows, columns=["symbol", "alpha_signal"]) if rows else pd.DataFrame(columns=["symbol", "alpha_signal"])
         return latest_ym, df
     finally:
         conn.close()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_market_cache_history(
+    db_path: Path, symbols: list[str], start_date: str, end_date: str,
+) -> pd.DataFrame:
+    """
+    从 market_cache 中查询指定标的在 [start_date, end_date] 区间的日线收盘价.
+
+    Args:
+        symbols: 6 位代码列表。传空列表 = 取全市场。
+
+    Returns:
+        pd.DataFrame [trade_date, symbol, close] 已排序.
+    """
+    if not db_path.exists():
+        return pd.DataFrame()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        if symbols:
+            placeholders = ",".join("?" for _ in symbols)
+            query = f"""
+                SELECT trade_date, symbol, close
+                FROM market_cache
+                WHERE trade_date >= ? AND trade_date <= ?
+                  AND symbol IN ({placeholders})
+                ORDER BY trade_date, symbol
+            """
+            params = [start_date, end_date] + list(symbols)
+        else:
+            query = """
+                SELECT trade_date, symbol, close
+                FROM market_cache
+                WHERE trade_date >= ? AND trade_date <= ?
+                ORDER BY trade_date, symbol
+            """
+            params = [start_date, end_date]
+        df = pd.read_sql_query(query, conn, params=params)
+        if not df.empty:
+            df["trade_date"] = pd.to_datetime(df["trade_date"])
+        return df
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_fundamentals(db_dir: Path = DEFAULT_DB_DIR) -> pd.DataFrame:
+    """
+    加载最新的基本面快照（市值 / 估值 / 行业分类）.
+
+    Returns:
+        pd.DataFrame 至少包含 [symbol, name, total_mcap, float_mcap, pb, pe_ttm, board].
+    """
+    fund_path = _find_latest_parquet("fundamentals_", db_dir)
+    if fund_path is None:
+        return pd.DataFrame()
+
+    df = pd.read_parquet(fund_path)
+
+    # 类型修正: 部分列可能以 object 存储
+    for col in ["float_mcap", "pb", "bps", "revenue", "operating_profit", "gross_margin", "pe_static"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
 # ═══════════════════════════════════════════════════════════
-# 数据获取层 — Baostock 交易日
+# Section 2 — Baostock 数据层
 # ═══════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_latest_trade_dates() -> Tuple[Optional[str], Optional[str]]:
-    """
-    通过 Baostock 的 query_trade_dates() 获取最近两个交易日。
-
-    回溯最近 10 个自然日，筛选出 is_trading_day == "1" 的最近 2 天，
-    作为 T 日（最近交易日）和 T-1 日（前一个交易日）。
-
-    Returns:
-        (t_date, t_minus_1_date) — "YYYY-MM-DD" 格式；若获取失败则为 (None, None)
-
-    Note:
-        非交易日（周末/节假日）：Baostock 仍会返回交易日列表，但最近交易日
-        将早于当日日期。UI 层会在 T 日期上显示真实的交易日期。
-    """
+def get_trade_dates(lookback_days: int = 10) -> Tuple[Optional[str], Optional[str]]:
+    """获取最近两个交易日 (T, T-1)."""
     end_date = date.today()
-    start_date = end_date - timedelta(days=10)
-
+    start_date = end_date - timedelta(days=lookback_days)
     try:
         rs = bs.query_trade_dates(
             start_date=start_date.strftime("%Y-%m-%d"),
@@ -143,570 +205,896 @@ def get_latest_trade_dates() -> Tuple[Optional[str], Optional[str]]:
         )
         if rs.error_code != "0":
             return None, None
-
-        trade_dates: list[str] = []
+        trade_dates = []
         while rs.next():
             row = rs.get_row_data()
-            # row[0] = calendar_date, row[1] = is_trading_day ("0"/"1")
-            is_trading = row[1].strip() == "1"
-            d = row[0].strip()
-            if is_trading and d <= end_date.strftime("%Y-%m-%d"):
-                trade_dates.append(d)
-
-        # 最新在前
+            if row[1].strip() == "1" and row[0].strip() <= end_date.strftime("%Y-%m-%d"):
+                trade_dates.append(row[0].strip())
         trade_dates.sort(reverse=True)
-
         if len(trade_dates) >= 2:
             return trade_dates[0], trade_dates[1]
         elif len(trade_dates) == 1:
             return trade_dates[0], None
-        else:
-            return None, None
+        return None, None
     except Exception:
         return None, None
 
 
-# ═══════════════════════════════════════════════════════════
-# 数据获取层 — Baostock 行情
-# ═══════════════════════════════════════════════════════════
-
-def fetch_close_prices(symbols: list[str], target_date: str) -> pd.DataFrame:
+def fetch_point_close(symbols: list[str], target_date: str) -> pd.DataFrame:
     """
-    逐只获取指定股票列表在 target_date 的收盘价（前复权）。
-
-    Baostock 没有批量日线接口，逐只调用 query_history_k_data_plus。
-    31 只标的 × 约 50ms/只 ≈ 1.5s，可接受。
+    逐只获取单日收盘价（前复权）.
 
     Args:
-        symbols:  6 位代码列表（不含 sh./sz. 前缀）。
-        target_date: "YYYY-MM-DD" 格式的交易日。
+        symbols: 6 位代码列表.  target_date: "YYYY-MM-DD".
 
     Returns:
-        pd.DataFrame with columns [symbol, close]。
-        无数据的标的 close = NaN。
+        [symbol, close] — 无数据为 NaN.
     """
     if not symbols:
         return pd.DataFrame(columns=["symbol", "close"])
-
-    results: list[dict] = []
+    results = []
     for sym in symbols:
         try:
             bs_code = _to_bs_code(sym)
             rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,close",
-                start_date=target_date,
-                end_date=target_date,
-                frequency="d",
-                adjustflag="2",  # 前复权
+                bs_code, "date,close",
+                start_date=target_date, end_date=target_date,
+                frequency="d", adjustflag="2",
             )
             if rs.error_code != "0":
                 results.append({"symbol": sym, "close": np.nan})
                 continue
-
             rows = []
             while rs.next():
                 rows.append(rs.get_row_data())
-
             if rows and rows[0][1]:
                 results.append({"symbol": sym, "close": float(rows[0][1])})
             else:
                 results.append({"symbol": sym, "close": np.nan})
         except Exception:
             results.append({"symbol": sym, "close": np.nan})
-
     return pd.DataFrame(results)
 
 
-def fetch_all_prices(
-    symbols: list[str],
-    t_date: str,
-    t1_date: Optional[str],
-    progress_placeholder,
-) -> pd.DataFrame:
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_benchmark_history(start_date: str, end_date: str) -> pd.DataFrame:
     """
-    拉取所有标的两日收盘价的主控函数。
-
-    分两次调用 fetch_close_prices（T 日 + T-1 日），合并为一张表。
-
-    Args:
-        symbols:    标的列表（含中证500代码）。
-        t_date:     T 日日期 "YYYY-MM-DD"。
-        t1_date:    T-1 日日期；None 时仅获取 T 日。
-        progress_placeholder: st.empty() 占位符，用于显示进度。
+    拉取中证500 (sh.000905) 在 [start_date, end_date] 区间的每日收盘价（前复权）.
 
     Returns:
-        pd.DataFrame with columns [symbol, close_t, close_t_minus_1]。
+        [trade_date, close].
     """
-    # ── T 日收盘价 ──
-    progress_placeholder.text(f"正在拉取 T={t_date} 收盘价（{len(symbols)} 只标的）...")
-    t_prices = fetch_close_prices(symbols, t_date)
-    t_prices = t_prices.rename(columns={"close": "close_t"})
+    try:
+        rs = bs.query_history_k_data_plus(
+            BENCHMARK_BS_CODE, "date,close",
+            start_date=start_date, end_date=end_date,
+            frequency="d", adjustflag="2",
+        )
+        if rs.error_code != "0":
+            return pd.DataFrame()
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=["date", "close"])
+        df["trade_date"] = pd.to_datetime(df["date"])
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["symbol"] = BENCHMARK_SYMBOL
+        return df[["trade_date", "symbol", "close"]].dropna(subset=["close"])
+    except Exception:
+        return pd.DataFrame()
 
-    # ── T-1 日收盘价 ──
-    if t1_date:
-        progress_placeholder.text(f"正在拉取 T-1={t1_date} 收盘价（{len(symbols)} 只标的）...")
-        t1_prices = fetch_close_prices(symbols, t1_date)
-        t1_prices = t1_prices.rename(columns={"close": "close_t_minus_1"})
-        result = t_prices.merge(t1_prices, on="symbol", how="left")
-    else:
-        result = t_prices.copy()
-        result["close_t_minus_1"] = np.nan
 
-    progress_placeholder.empty()
-    return result
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stock_names(symbols: list[str]) -> dict[str, str]:
+    """
+    批量获取股票名称（用于 ST 检测）.
+
+    Baostock query_stock_basic 逐只调用; 30 只约 1.5s.
+    同时尝试从 fundamentals 缓存补充.
+
+    Returns:
+        {symbol: name} 映射; 获取失败的 symbol 值为 "UNKNOWN".
+    """
+    # 优先从 fundamentals 缓存获取
+    fund = load_fundamentals()
+    name_map: dict[str, str] = {}
+    if not fund.empty and "name" in fund.columns:
+        for _, row in fund.iterrows():
+            name_map[str(row["symbol"]).zfill(6)] = str(row["name"])
+
+    # 补充 baostock（只获取未命中缓存的）
+    missing = [s for s in symbols if s not in name_map]
+    if missing:
+        for sym in missing:
+            try:
+                rs = bs.query_stock_basic(code=_to_bs_code(sym))
+                if rs.error_code == "0":
+                    while rs.next():
+                        row_data = rs.get_row_data()
+                        if row_data and len(row_data) >= 2:
+                            name_map[sym] = row_data[1].strip()
+                            break
+            except Exception:
+                pass
+        # 仍未获取到的标记为 UNKNOWN
+        for sym in missing:
+            if sym not in name_map:
+                name_map[sym] = "UNKNOWN"
+
+    return name_map
 
 
 # ═══════════════════════════════════════════════════════════
-# 计算层
+# Section 3 — 计算层: 单日收益 + 组合指标
 # ═══════════════════════════════════════════════════════════
 
-def compute_returns(prices_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    计算每只标的的单日涨跌幅。
-
-    daily_return = (close_t - close_t_minus_1) / close_t_minus_1
-
-    Args:
-        prices_df: [symbol, close_t, close_t_minus_1]
-
-    Returns:
-        同 schema + daily_return 列。无效数据 daily_return = NaN。
-    """
+def compute_daily_returns(prices_df: pd.DataFrame) -> pd.DataFrame:
+    """daily_return = (close_t - close_t_minus_1) / close_t_minus_1."""
     df = prices_df.copy()
-    valid_mask = df["close_t_minus_1"].notna() & (df["close_t_minus_1"] > 0)
+    mask = df["close_t_minus_1"].notna() & (df["close_t_minus_1"] > 0)
     df["daily_return"] = np.where(
-        valid_mask,
+        mask,
         (df["close_t"] - df["close_t_minus_1"]) / df["close_t_minus_1"],
         np.nan,
     )
     return df
 
 
-def compute_portfolio_metrics(
-    returns_df: pd.DataFrame,
-    benchmark_symbol: str = BENCHMARK_SYMBOL,
-) -> dict:
-    """
-    计算组合级别的三个核心 KPI 指标。
+def compute_metrics(returns_df: pd.DataFrame, bm_symbol: str = BENCHMARK_SYMBOL) -> dict:
+    """计算单日组合/基准/Alpha KPI."""
+    bm_row = returns_df[returns_df["symbol"] == bm_symbol]
+    bm_ret = float(bm_row["daily_return"].values[0]) if len(bm_row) > 0 and pd.notna(bm_row["daily_return"].values[0]) else np.nan
 
-    - 组合收益率 (Portfolio Return):  30 只持仓涨跌幅的等权平均
-    - 基准收益率 (Benchmark Return):  中证500 的涨跌幅
-    - 单日超额收益 (Daily Alpha):     组合收益率 - 基准收益率
-
-    Args:
-        returns_df:     [symbol, daily_return] 的 DataFrame
-        benchmark_symbol: 基准指数 6 位代码
-
-    Returns:
-        {
-            "portfolio_return":  float or NaN,
-            "benchmark_return":  float or NaN,
-            "daily_alpha":       float or NaN,
-            "n_stocks":          int,   # 有效（有数据）持仓数
-            "n_missing":         int,   # 无数据持仓数
-            "n_positive":        int,   # 上涨家数
-            "n_negative":        int,   # 下跌家数
-        }
-    """
-    # ── 基准收益率 ──
-    bench_mask = returns_df["symbol"] == benchmark_symbol
-    bench_row = returns_df[bench_mask]
-    benchmark_return = (
-        bench_row["daily_return"].values[0]
-        if len(bench_row) > 0 and pd.notna(bench_row["daily_return"].values[0])
-        else np.nan
-    )
-
-    # ── 持仓收益率（排除基准行）──
-    holdings = returns_df[~bench_mask].copy()
+    holdings = returns_df[returns_df["symbol"] != bm_symbol].copy()
     valid = holdings["daily_return"].dropna()
 
-    n_stocks = len(valid)
-    n_total_holdings = len(holdings)
-    n_missing = n_total_holdings - n_stocks
-    n_positive = int((valid > 0).sum())
-    n_negative = int((valid < 0).sum())
-
-    portfolio_return = valid.mean() if n_stocks > 0 else np.nan
-
-    # ── Alpha ──
-    if (not np.isnan(portfolio_return)) and (not np.isnan(benchmark_return)):
-        daily_alpha = portfolio_return - benchmark_return
-    else:
-        daily_alpha = np.nan
+    pf_ret = valid.mean() if len(valid) > 0 else np.nan
+    alpha = (pf_ret - bm_ret) if (not np.isnan(pf_ret) and not np.isnan(bm_ret)) else np.nan
 
     return {
-        "portfolio_return": portfolio_return,
-        "benchmark_return": benchmark_return,
-        "daily_alpha": daily_alpha,
-        "n_stocks": n_stocks,
-        "n_missing": n_missing,
-        "n_positive": n_positive,
-        "n_negative": n_negative,
+        "portfolio_return": pf_ret,
+        "benchmark_return": bm_ret,
+        "daily_alpha": alpha,
+        "n_stocks": len(valid),
+        "n_missing": len(holdings) - len(valid),
+        "n_positive": int((valid > 0).sum()),
+        "n_negative": int((valid < 0).sum()),
     }
 
 
 # ═══════════════════════════════════════════════════════════
-# UI 渲染层 — KPI 卡片
+# Section 4 — 计算层: 累计净值历史 (Historical NAV)
 # ═══════════════════════════════════════════════════════════
 
-def _metric_arrow(val: float | None) -> str:
-    """返回涨跌方向箭头。"""
-    if val is None or np.isnan(val):
-        return "➖"
+def compute_cumulative_nav(
+    db_path: Path,
+    symbols: list[str],
+    ym: str,
+    t_date: str,
+) -> Optional[pd.DataFrame]:
+    """
+    构建持有期累计净值曲线 (组合 / 基准 / Alpha).
+
+    数据来源:
+      - 持仓股票: SQLite market_cache (日线缓存)
+      - 基准指数: Baostock 日线 (从月初到 T)
+
+    Args:
+        db_path: state.db 路径.
+        symbols: Top 30 持仓代码列表.
+        ym:      调仓月份 "YYYY-MM".
+        t_date:  T 日日期.
+
+    Returns:
+        pd.DataFrame [trade_date, portfolio_nav, benchmark_nav, cumulative_alpha]
+        或 None（数据不足）.
+    """
+    # ── 确定回看起始日: ym 月份第一个交易日 ──
+    start_date = f"{ym}-01"
+
+    # ── 基准历史 ──
+    bench_hist = fetch_benchmark_history(start_date, t_date)
+    if bench_hist.empty:
+        return None
+
+    # ── 持仓历史 ──
+    market_hist = load_market_cache_history(db_path, symbols, start_date, t_date)
+    if market_hist.empty:
+        return None
+
+    # ── 计算每日等权组合收益 ──
+    # 每只股票: daily_return = close / close.shift(1) - 1
+    market_hist = market_hist.sort_values(["symbol", "trade_date"])
+    market_hist["prev_close"] = market_hist.groupby("symbol")["close"].shift(1)
+    market_hist["daily_return"] = np.where(
+        market_hist["prev_close"].notna() & (market_hist["prev_close"] > 0),
+        market_hist["close"] / market_hist["prev_close"] - 1,
+        np.nan,
+    )
+    # 等权平均
+    daily_pf = market_hist.groupby("trade_date")["daily_return"].mean().reset_index()
+    daily_pf.columns = ["trade_date", "pf_return"]
+
+    # ── 基准每日收益 ──
+    bench_hist = bench_hist.sort_values("trade_date")
+    bench_hist["prev_close"] = bench_hist["close"].shift(1)
+    bench_hist["bm_return"] = np.where(
+        bench_hist["prev_close"].notna() & (bench_hist["prev_close"] > 0),
+        bench_hist["close"] / bench_hist["prev_close"] - 1,
+        0.0,
+    )
+
+    # ── 合并 ──
+    merged = daily_pf.merge(
+        bench_hist[["trade_date", "bm_return"]],
+        on="trade_date", how="inner"
+    ).sort_values("trade_date")
+
+    if len(merged) < 2:
+        return None
+
+    # ── 累计净值 ──
+    merged["portfolio_nav"] = (1 + merged["pf_return"]).cumprod()
+    merged["benchmark_nav"]  = (1 + merged["bm_return"]).cumprod()
+    merged["cumulative_alpha"] = merged["portfolio_nav"] / merged["benchmark_nav"] - 1
+
+    return merged[["trade_date", "portfolio_nav", "benchmark_nav", "cumulative_alpha"]]
+
+
+# ═══════════════════════════════════════════════════════════
+# Section 5 — 计算层: 风格因子暴露度
+# ═══════════════════════════════════════════════════════════
+
+def compute_factor_exposures(
+    symbols: list[str],
+    db_path: Path,
+    t_date: str,
+) -> dict:
+    """
+    计算 Top 30 持仓在核心因子上的横截面暴露.
+
+    因子:
+      - Size (市值):       total_mcap 百分位均值 (高 = 大盘)
+      - Momentum (动量):   持有期内收益百分位均值 (高 = 动量)
+      - Value (价值):      EP (1/PE) 百分位均值 — PB 数据不全时的代理 (高 = 价值)
+      - Volatility (波):   可用日收益的波动率百分位均值 (高 = 高波动)
+
+    所有因子均做横截面排序 → 百分位 (0-100), 50 = 中性.
+
+    Args:
+        symbols: Top 30 持仓列表.
+        db_path: state.db 路径.
+        t_date:  T 日日期.
+
+    Returns:
+        {
+            "Size":        {"value": 65.2, "label": "...", "note": "..."},
+            ...
+        }
+        因子标签含中文风格判定.
+    """
+    exposures = {}
+    t_dt = pd.Timestamp(t_date)
+    fund = load_fundamentals()
+
+    # ── Size (市值): 用 total_mcap (float_mcap 在当前数据源中全为空) ──
+    if not fund.empty and "total_mcap" in fund.columns:
+        fund_clean = fund.dropna(subset=["total_mcap"]).copy()
+        if len(fund_clean) >= 100:
+            fund_clean["mcap_pct"] = fund_clean["total_mcap"].rank(pct=True) * 100
+            fund_clean["sym6"] = fund_clean["symbol"].str.zfill(6)
+            held = fund_clean[fund_clean["sym6"].isin(symbols)]
+            if not held.empty:
+                val = round(held["mcap_pct"].mean(), 1)
+                exposures["Size"] = {
+                    "value": val,
+                    "label": _size_label(val),
+                    "note": f"基于 total_mcap ({len(fund_clean)} 只全市场)",
+                }
+
+    # ── Value (EP = 1/PE): PB 数据源当前不可用, 用 EP 代理 ──
+    if not fund.empty and "pe_ttm" in fund.columns:
+        fund_val = fund.dropna(subset=["pe_ttm"]).copy()
+        fund_val = fund_val[fund_val["pe_ttm"] > 0]  # PE < 0 无意义
+        if len(fund_val) >= 100:
+            # EP (Earnings Yield) = 1/PE → 高 EP = 价值股
+            fund_val["ep"] = 1.0 / fund_val["pe_ttm"]
+            fund_val["value_pct"] = fund_val["ep"].rank(pct=True) * 100
+            fund_val["sym6"] = fund_val["symbol"].str.zfill(6)
+            held_val = fund_val[fund_val["sym6"].isin(symbols)]
+            if not held_val.empty:
+                val = round(held_val["value_pct"].mean(), 1)
+                exposures["Value"] = {
+                    "value": val,
+                    "label": _value_label(val),
+                    "note": f"EP (1/PE) 代理, {len(fund_val)} 只有效",
+                }
+
+    # ── Momentum: 持有期内区间收益（market_cache 可能不足 21 天）─
+    lookback_start = (t_dt - pd.DateOffset(days=35)).strftime("%Y-%m-%d")
+    market = load_market_cache_history(db_path, [], lookback_start, t_date)
+    if not market.empty:
+        market = market.sort_values(["symbol", "trade_date"])
+        agg = market.groupby("symbol").agg(
+            close_start=("close", "first"),
+            close_end=("close", "last"),
+            n_days=("trade_date", "nunique"),
+        ).reset_index()
+        # 至少需要 3 个交易日才有意义
+        agg = agg[agg["n_days"] >= 3].copy()
+        agg["period_return"] = np.where(
+            agg["close_start"] > 0,
+            agg["close_end"] / agg["close_start"] - 1,
+            np.nan,
+        )
+        agg = agg.dropna(subset=["period_return"])
+        if len(agg) >= 100:
+            agg["mom_pct"] = agg["period_return"].rank(pct=True) * 100
+            held_mom = agg[agg["symbol"].isin(symbols)]
+            if not held_mom.empty:
+                val = round(held_mom["mom_pct"].mean(), 1)
+                max_days = int(agg["n_days"].max())
+                exposures["Momentum"] = {
+                    "value": val,
+                    "label": _mom_label(val),
+                    "note": f"区间收益 ({max_days} 交易日, "
+                            f"{lookback_start} ~ {t_date})",
+                }
+
+    # ── Volatility: 可用交易日内的日收益波动率 (年化) ──
+    lookback_vol = (t_dt - pd.DateOffset(days=40)).strftime("%Y-%m-%d")
+    market_vol = load_market_cache_history(db_path, [], lookback_vol, t_date)
+    if not market_vol.empty:
+        market_vol = market_vol.sort_values(["symbol", "trade_date"])
+        def _vol(grp):
+            if len(grp) < 3:
+                return pd.Series({"vol_d": np.nan, "n_days": 0})
+            rets = grp.sort_values("trade_date")["close"].pct_change().dropna()
+            if len(rets) < 2:
+                return pd.Series({"vol_d": np.nan, "n_days": 0})
+            return pd.Series({
+                "vol_d": rets.std() * np.sqrt(252),  # 年化
+                "n_days": len(grp),
+            })
+        vols = market_vol.groupby("symbol").apply(_vol).reset_index()
+        vols = vols.dropna(subset=["vol_d"])
+        if len(vols) >= 100:
+            vols["vol_pct"] = vols["vol_d"].rank(pct=True) * 100
+            held_vol = vols[vols["symbol"].isin(symbols)]
+            if not held_vol.empty:
+                val = round(held_vol["vol_pct"].mean(), 1)
+                max_d = int(vols["n_days"].max())
+                exposures["Volatility"] = {
+                    "value": val,
+                    "label": _vol_label(val),
+                    "note": f"基于 {max_d} 交易日收益序列",
+                }
+
+    return exposures
+
+
+def _size_label(pct: float) -> str:
+    if pct >= 70:  return "大盘偏重 🔵"
+    elif pct >= 55: return "略偏大盘"
+    elif pct >= 45: return "均衡 ⚖️"
+    elif pct >= 30: return "略偏小盘"
+    else:           return "小盘偏重 🟠"
+
+
+def _mom_label(pct: float) -> str:
+    if pct >= 70:  return "强动量 🚀"
+    elif pct >= 55: return "轻度动量"
+    elif pct >= 45: return "中性"
+    elif pct >= 30: return "轻度反转"
+    else:           return "强反转 🔄"
+
+
+def _value_label(pct: float) -> str:
+    if pct >= 70:  return "深度价值 💎"
+    elif pct >= 55: return "略偏价值"
+    elif pct >= 45: return "均衡"
+    elif pct >= 30: return "略偏成长"
+    else:           return "成长偏重 🌱"
+
+
+def _vol_label(pct: float) -> str:
+    if pct >= 70:  return "高波动 ⚡"
+    elif pct >= 55: return "略偏高波动"
+    elif pct >= 45: return "中性波动"
+    elif pct >= 30: return "略偏低波动"
+    else:           return "低波动 🛡️"
+
+
+# ═══════════════════════════════════════════════════════════
+# Section 6 — 计算层: 风控雷达
+# ═══════════════════════════════════════════════════════════
+
+def scan_risk_events(
+    returns_df: pd.DataFrame,
+    name_map: dict[str, str],
+    positions_df: pd.DataFrame,
+) -> list[dict]:
+    """
+    扫描 Top 30 组合的风险事件.
+
+    扫描项:
+      1. 暴跌: 单日涨跌幅 < -7%
+      2. ST 标记: 股票名称含 "ST" 或 "*ST"
+      3. 疑似停牌: T-1 有数据但 T 日无收盘价
+
+    Returns:
+        [{symbol, name, risk_type, detail, severity}] 列表.
+    """
+    alerts: list[dict] = []
+
+    holdings = returns_df[returns_df["symbol"] != BENCHMARK_SYMBOL].copy()
+
+    for _, row in holdings.iterrows():
+        sym = row["symbol"]
+        name = name_map.get(sym, "UNKNOWN")
+        ret = row.get("daily_return", np.nan)
+        close_t = row.get("close_t", np.nan)
+        close_t1 = row.get("close_t_minus_1", np.nan)
+
+        # 1. 暴跌检测
+        if pd.notna(ret) and ret < DRAWDOWN_ALERT_THRESHOLD:
+            alerts.append({
+                "symbol": sym,
+                "name": name,
+                "risk_type": "📉 单日暴跌",
+                "detail": f"跌幅 {ret*100:.1f}%（超过 -7% 阈值）",
+                "severity": "error",
+            })
+
+        # 2. ST 检测
+        if "ST" in name or "*ST" in name:
+            alerts.append({
+                "symbol": sym,
+                "name": name,
+                "risk_type": "⚠️ ST 警示",
+                "detail": f"股票名称为 {name}，存在退市风险警示",
+                "severity": "error",
+            })
+
+        # 3. 疑似停牌: T-1 有数据, T 日无
+        if pd.notna(close_t1) and pd.isna(close_t) and close_t1 > 0:
+            alerts.append({
+                "symbol": sym,
+                "name": name,
+                "risk_type": "🔒 疑似停牌",
+                "detail": f"T-1 收盘 {close_t1:.2f}，T 日无交易数据",
+                "severity": "warning",
+            })
+
+    return alerts
+
+
+# ═══════════════════════════════════════════════════════════
+# Section 7 — UI: 顶部风险雷达
+# ═══════════════════════════════════════════════════════════
+
+def render_risk_radar(alerts: list[dict]):
+    """在页面最上方渲染醒目的高风险提示."""
+    if not alerts:
+        st.success("✅ 风控扫描通过 — 无暴跌、无 ST、无停牌异常")
+        return
+
+    errors   = [a for a in alerts if a["severity"] == "error"]
+    warnings = [a for a in alerts if a["severity"] == "warning"]
+
+    if errors:
+        st.error(f"🚨 **高危风险警报 — {len(errors)} 项异常**")
+        for a in errors:
+            st.markdown(
+                f"> 📛 **{a['risk_type']}** | `{a['symbol']}` {a['name']} | {a['detail']}"
+            )
+
+    if warnings:
+        st.warning(f"⚠️ **风控提示 — {len(warnings)} 项需关注**")
+        for a in warnings:
+            st.markdown(
+                f"> 🔸 **{a['risk_type']}** | `{a['symbol']}` {a['name']} | {a['detail']}"
+            )
+
+
+# ═══════════════════════════════════════════════════════════
+# Section 8 — UI: KPI 卡片
+# ═══════════════════════════════════════════════════════════
+
+def _arrow(val: float | None) -> str:
+    if val is None or np.isnan(val): return "➖"
     return "🟢" if val > 0 else "🔴" if val < 0 else "➖"
 
 
 def render_kpi_cards(metrics: dict):
-    """
-    渲染顶部三列 KPI 指标卡片。
+    """三列 KPI: 组合收益 / 基准收益 / Alpha."""
+    c1, c2, c3 = st.columns(3)
 
-    使用 st.metric 组件，正值为绿色 (normal)，负值为红色 (inverse)。
-    """
-    col1, col2, col3 = st.columns(3)
+    with c1:
+        v = metrics["portfolio_return"]
+        st.metric(
+            label=f"{_arrow(v)} 组合日收益",
+            value=f"{v*100:+.2f}%" if not np.isnan(v) else "N/A",
+            delta=f"基准 {metrics['benchmark_return']*100:+.2f}%"
+            if not np.isnan(metrics.get("benchmark_return", np.nan)) else None,
+            delta_color="off",
+        )
+    with c2:
+        v = metrics["benchmark_return"]
+        st.metric(
+            label=f"{_arrow(v)} 中证500",
+            value=f"{v*100:+.2f}%" if not np.isnan(v) else "N/A",
+        )
+    with c3:
+        v = metrics["daily_alpha"]
+        label = ("🌟 超额 Alpha" if v > 0 else "⚡ 负 Alpha" if v < 0 else "Alpha = 0") if not np.isnan(v) else "Alpha N/A"
+        st.metric(
+            label=label,
+            value=f"{v*100:+.2f}%" if not np.isnan(v) else "N/A",
+        )
 
-    with col1:
-        val = metrics["portfolio_return"]
-        if not np.isnan(val):
-            st.metric(
-                label=f"{_metric_arrow(val)} 组合收益率",
-                value=f"{val * 100:+.2f}%",
-                delta=f"基准: {metrics['benchmark_return'] * 100:+.2f}%"
-                if not np.isnan(metrics.get("benchmark_return", np.nan))
-                else None,
-                delta_color="off",
-            )
-        else:
-            st.metric(label="📈 组合收益率", value="N/A")
-
-    with col2:
-        val = metrics["benchmark_return"]
-        if not np.isnan(val):
-            st.metric(
-                label=f"{_metric_arrow(val)} 中证500 收益率",
-                value=f"{val * 100:+.2f}%",
-            )
-        else:
-            st.metric(label="🏦 中证500 收益率", value="N/A")
-
-    with col3:
-        val = metrics["daily_alpha"]
-        if not np.isnan(val):
-            label = (
-                "🌟 正 Alpha (超额)"
-                if val > 0
-                else "⚡ 负 Alpha"
-                if val < 0
-                else "➖ Alpha = 0"
-            )
-            st.metric(
-                label=label,
-                value=f"{val * 100:+.2f}%",
-            )
-        else:
-            st.metric(label="🚀 今日 Alpha", value="N/A")
-
-    # ── 数据质量提示 ──
     if metrics.get("n_missing", 0) > 0:
-        st.info(
-            f"⚠️ {metrics['n_missing']} 只股票在 T 日 / T-1 日无有效数据，"
-            f"已排除在组合收益率计算之外。"
+        st.caption(f"⚠️ {metrics['n_missing']} 只无有效数据，已排除")
+
+
+# ═══════════════════════════════════════════════════════════
+# Section 9 — UI: 历史超额走势图
+# ═══════════════════════════════════════════════════════════
+
+def render_historical_nav(nav_df: pd.DataFrame, ym: str):
+    """累计净值三线图: 组合 / 基准 / 累计超额."""
+    st.markdown(f"### 📈 持有期累计净值 — 自 {ym} 调仓以来")
+
+    if nav_df is None or nav_df.empty:
+        st.info("历史数据不足（需至少 2 个交易日），累计净值将在后续交易日自动生成。")
+        return
+
+    # 准备 chart data
+    chart_df = nav_df.set_index("trade_date")[["portfolio_nav", "benchmark_nav"]].copy()
+    chart_df.columns = ["Top 30 组合", "中证500"]
+
+    # 摘要指标
+    last_row = nav_df.iloc[-1]
+    pf_nav   = last_row["portfolio_nav"]
+    bm_nav   = last_row["benchmark_nav"]
+    alpha_cum = last_row["cumulative_alpha"]
+
+    cols = st.columns(4)
+    cols[0].metric("组合累计净值", f"{pf_nav:.4f}")
+    cols[1].metric("基准累计净值", f"{bm_nav:.4f}")
+    cols[2].metric(
+        "累计超额收益",
+        f"{alpha_cum*100:+.2f}%",
+        delta=f"{alpha_cum*100:+.2f}%" if alpha_cum != 0 else None,
+        delta_color="normal" if alpha_cum > 0 else "inverse",
+    )
+    cols[3].metric("持有交易日", f"{len(nav_df)} 天")
+
+    # 三线图
+    st.line_chart(chart_df, height=350, use_container_width=True)
+
+    # 累计 Alpha 独立图
+    alpha_chart = nav_df.set_index("trade_date")[["cumulative_alpha"]].copy()
+    alpha_chart.columns = ["累计超额 Alpha"]
+    st.line_chart(alpha_chart, height=200, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# Section 10 — UI: 风格因子暴露度
+# ═══════════════════════════════════════════════════════════
+
+def render_factor_exposure(exposures: dict):
+    """横向柱状图展示因子暴露度，50 为中性参考线."""
+    st.markdown("### 🧬 组合风格因子暴露度 (横截面百分位)")
+
+    if not exposures:
+        st.info("因子暴露数据暂不可用（需基本面 + 行情缓存支持）。数据将随交易日积累自动补充。")
+        return
+
+    # 准备表数据
+    records = []
+    missing_factors = []
+    all_factors = ["Size", "Value", "Momentum", "Volatility"]
+    for factor in all_factors:
+        if factor in exposures:
+            info = exposures[factor]
+            records.append({
+                "因子": factor,
+                "暴露度 (百分位)": info["value"],
+                "偏离": info["value"] - 50,
+                "风格判断": info.get("label", ""),
+            })
+        else:
+            missing_factors.append(factor)
+
+    if not records:
+        st.info("当前无任何因子暴露数据可用。")
+        return
+
+    exp_df = pd.DataFrame(records).set_index("因子")
+
+    col_chart, col_table = st.columns([3, 2])
+
+    with col_chart:
+        chart_data = exp_df[["暴露度 (百分位)"]].copy()
+        chart_data["中性基准 (50)"] = 50
+        st.bar_chart(
+            chart_data,
+            height=280,
+            use_container_width=True,
+        )
+
+    with col_table:
+        st.dataframe(
+            exp_df[["暴露度 (百分位)", "风格判断"]],
+            hide_index=False,
+            use_container_width=True,
+            column_config={
+                "暴露度 (百分位)": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+        # 显示每个因子的计算说明
+        for factor in all_factors:
+            if factor in exposures and "note" in exposures[factor]:
+                st.caption(f"📝 *{factor}*: {exposures[factor]['note']}")
+
+    # 文字解读
+    high_factors = [(k, v) for k, v in exposures.items() if v["value"] >= 60]
+    low_factors  = [(k, v) for k, v in exposures.items() if v["value"] <= 40]
+
+    if high_factors or low_factors:
+        parts = []
+        for f, info in high_factors:
+            parts.append(f"**{f}** 偏重 ({info['value']:.0f} 分位)")
+        for f, info in low_factors:
+            parts.append(f"**{f}** 偏低 ({info['value']:.0f} 分位)")
+        st.caption("📌 风格漂移提示: " + "；".join(parts) if parts else "风格中性")
+    else:
+        st.caption("✅ 风格暴露接近中性，无明显漂移")
+
+    if missing_factors:
+        st.caption(
+            f"⏳ 待补充因子: {', '.join(missing_factors)} "
+            f"— 数据积累中（需更多交易日）"
         )
 
 
 # ═══════════════════════════════════════════════════════════
-# UI 渲染层 — 涨跌排名摘要
+# Section 11 — UI: 红黑榜 + 全景表
+# ═══════════════════════════════════════════════════════════
+
+def render_top_bottom(returns_df: pd.DataFrame):
+    """涨幅 Top 3 / 跌幅 Top 3 + 柱状图."""
+    holdings = returns_df[returns_df["symbol"] != BENCHMARK_SYMBOL].copy()
+    valid = holdings.dropna(subset=["daily_return"]).sort_values("daily_return", ascending=False)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### 🟢 涨幅 Top 3")
+        top3 = valid.head(3)
+        if len(top3) > 0:
+            disp = top3[["symbol", "daily_return"]].copy()
+            disp["daily_return"] = disp["daily_return"].apply(lambda x: f"{x*100:+.2f}%")
+            disp.columns = ["代码", "涨跌幅"]
+            st.dataframe(disp, hide_index=True, use_container_width=True)
+            chart = top3.set_index("symbol")[["daily_return"]] * 100
+            st.bar_chart(chart, height=160, color="#22c55e")
+        else:
+            st.write("—")
+
+    with right:
+        st.markdown("#### 🔴 跌幅 Top 3")
+        bottom3 = valid.tail(3).sort_values("daily_return", ascending=True)
+        if len(bottom3) > 0:
+            disp = bottom3[["symbol", "daily_return"]].copy()
+            disp["daily_return"] = disp["daily_return"].apply(lambda x: f"{x*100:+.2f}%")
+            disp.columns = ["代码", "涨跌幅"]
+            st.dataframe(disp, hide_index=True, use_container_width=True)
+            chart = bottom3.set_index("symbol")[["daily_return"]] * 100
+            st.bar_chart(chart, height=160, color="#ef4444")
+        else:
+            st.write("—")
+
+
+def render_full_table(returns_df: pd.DataFrame, ym: str):
+    """全景持仓明细表，按涨跌幅降序排列."""
+    st.markdown(f"### 📋 全景持仓明细 — 调仓期 `{ym}`")
+
+    holdings = returns_df[returns_df["symbol"] != BENCHMARK_SYMBOL].copy()
+    if holdings.empty:
+        st.write("无数据")
+        return
+
+    holdings = holdings.sort_values("daily_return", ascending=False, na_position="last")
+
+    disp = holdings[["symbol", "close_t_minus_1", "close_t", "daily_return"]].copy()
+    disp["close_t_minus_1"] = disp["close_t_minus_1"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+    disp["close_t"]         = disp["close_t"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+    disp["daily_return"]    = disp["daily_return"].apply(lambda x: f"{x*100:+.2f}%" if pd.notna(x) else "N/A")
+    disp.columns = ["代码", "T-1 收盘", "T 收盘", "涨跌幅"]
+
+    st.dataframe(disp, hide_index=True, use_container_width=True, height=850)
+
+    n_total = len(holdings)
+    n_valid = holdings["daily_return"].notna().sum()
+    n_pos   = int((holdings["daily_return"] > 0).sum())
+    n_neg   = int((holdings["daily_return"] < 0).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总持仓", f"{n_total} 只")
+    c2.metric("有效数据", f"{n_valid} 只")
+    c3.metric("上涨", f"{n_pos} 只", delta=f"{n_pos/max(n_valid,1)*100:.0f}%" if n_valid else None, delta_color="normal")
+    c4.metric("下跌", f"{n_neg} 只", delta=f"{n_neg/max(n_valid,1)*100:.0f}%" if n_valid else None, delta_color="inverse")
+
+    # 胜率条
+    if n_valid > 0:
+        win_rate = n_pos / n_valid
+        st.progress(win_rate, text=f"日胜率: {win_rate*100:.0f}% ({n_pos}/{n_valid})")
+
+
+# ═══════════════════════════════════════════════════════════
+# Section 12 — 市场宽度
 # ═══════════════════════════════════════════════════════════
 
 def render_market_breadth(metrics: dict):
-    """渲染市场宽度摘要（上涨 vs 下跌家数）。"""
+    """上涨 vs 下跌 vs 平盘的简洁摘要."""
     n_pos = metrics.get("n_positive", 0)
     n_neg = metrics.get("n_negative", 0)
     n_valid = n_pos + n_neg
     if n_valid == 0:
         return
-
-    pos_pct = n_pos / n_valid * 100
-    neg_pct = n_neg / n_valid * 100
-
-    cols = st.columns(8)
-    cols[0].metric("上涨家数", f"{n_pos} 只")
-    cols[1].metric("下跌家数", f"{n_neg} 只")
-    cols[2].metric("上涨占比", f"{pos_pct:.0f}%")
-    cols[3].metric("下跌占比", f"{neg_pct:.0f}%")
+    cols = st.columns(4)
+    cols[0].metric("🟢 上涨", f"{n_pos} 只")
+    cols[1].metric("🔴 下跌", f"{n_neg} 只")
+    cols[2].metric("📊 上涨占比", f"{n_pos/max(n_valid,1)*100:.0f}%")
+    cols[3].metric("📉 下跌占比", f"{n_neg/max(n_valid,1)*100:.0f}%")
 
 
 # ═══════════════════════════════════════════════════════════
-# UI 渲染层 — 红黑榜（Top / Bottom 3）
-# ═══════════════════════════════════════════════════════════
-
-def render_top_bottom(returns_df: pd.DataFrame):
-    """
-    渲染红黑榜区域 — 涨幅前三 + 跌幅前三，配柱状图。
-    """
-    # 排除基准指数
-    holdings = returns_df[returns_df["symbol"] != BENCHMARK_SYMBOL].copy()
-    valid = holdings.dropna(subset=["daily_return"]).sort_values(
-        "daily_return", ascending=False
-    )
-
-    col_left, col_right = st.columns(2)
-
-    # ── 涨幅前 3 ──
-    with col_left:
-        st.markdown("### 🟢 涨幅 Top 3")
-        top3 = valid.head(3)
-        if len(top3) > 0:
-            # 表格
-            top3_display = top3[["symbol", "daily_return"]].copy()
-            top3_display["daily_return"] = top3_display["daily_return"].apply(
-                lambda x: f"{x * 100:+.2f}%"
-            )
-            top3_display.columns = ["股票代码", "涨跌幅"]
-            st.dataframe(
-                top3_display,
-                hide_index=True,
-                use_container_width=True,
-            )
-            # 柱状图
-            chart_data = top3.set_index("symbol")[["daily_return"]] * 100
-            chart_data.columns = ["涨跌幅 (%)"]
-            st.bar_chart(chart_data, height=180, color="#22c55e")
-        else:
-            st.write("无有效数据")
-
-    # ── 跌幅前 3 ──
-    with col_right:
-        st.markdown("### 🔴 跌幅 Top 3")
-        bottom3 = valid.tail(3).sort_values("daily_return", ascending=True)
-        if len(bottom3) > 0:
-            bottom3_display = bottom3[["symbol", "daily_return"]].copy()
-            bottom3_display["daily_return"] = bottom3_display["daily_return"].apply(
-                lambda x: f"{x * 100:+.2f}%"
-            )
-            bottom3_display.columns = ["股票代码", "涨跌幅"]
-            st.dataframe(
-                bottom3_display,
-                hide_index=True,
-                use_container_width=True,
-            )
-            # 柱状图
-            chart_data = bottom3.set_index("symbol")[["daily_return"]] * 100
-            chart_data.columns = ["涨跌幅 (%)"]
-            st.bar_chart(chart_data, height=180, color="#ef4444")
-        else:
-            st.write("无有效数据")
-
-
-# ═══════════════════════════════════════════════════════════
-# UI 渲染层 — 全景持仓明细表
-# ═══════════════════════════════════════════════════════════
-
-def render_full_table(returns_df: pd.DataFrame, positions_df: pd.DataFrame, ym: str):
-    """
-    渲染完整持仓明细 DataFrame，按涨跌幅降序排列。
-
-    Args:
-        returns_df:   合并了 alpha_signal 的收益率 DataFrame
-        positions_df: 原始持仓 DataFrame（用于显示信号强度）
-        ym:           调仓月份
-    """
-    st.markdown(f"### 📋 全景持仓明细 — 调仓期: `{ym}`")
-
-    # 排除基准行
-    holdings = returns_df[returns_df["symbol"] != BENCHMARK_SYMBOL].copy()
-
-    if holdings.empty:
-        st.write("无持仓数据")
-        return
-
-    # 按涨跌幅降序排列（NaN 沉底）
-    holdings = holdings.sort_values(
-        "daily_return", ascending=False, na_position="last"
-    ).reset_index(drop=True)
-
-    # 构造展示用 DataFrame
-    display_df = holdings[["symbol", "close_t_minus_1", "close_t", "daily_return"]].copy()
-
-    # 格式化
-    def _fmt_price(x):
-        return f"{x:.2f}" if pd.notna(x) else "N/A"
-
-    def _fmt_return(x):
-        return f"{x * 100:+.2f}%" if pd.notna(x) else "N/A"
-
-    display_df["close_t_minus_1"] = display_df["close_t_minus_1"].apply(_fmt_price)
-    display_df["close_t"] = display_df["close_t"].apply(_fmt_price)
-    display_df["daily_return"] = display_df["daily_return"].apply(_fmt_return)
-
-    display_df.columns = ["股票代码", "T-1 收盘价", "T 收盘价", "今日涨跌幅"]
-
-    st.dataframe(
-        display_df,
-        hide_index=True,
-        use_container_width=True,
-        height=850,
-    )
-
-    # ── 快速统计 ──
-    n_total = len(holdings)
-    n_valid = holdings["daily_return"].notna().sum()
-    n_positive = int((holdings["daily_return"] > 0).sum())
-    n_negative = int((holdings["daily_return"] < 0).sum())
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("总持仓", f"{n_total} 只")
-    col2.metric("有效数据", f"{n_valid} 只")
-    col3.metric(
-        "上涨",
-        f"{n_positive} 只",
-        delta=f"占比 {n_positive / n_valid * 100:.0f}%" if n_valid > 0 else None,
-        delta_color="normal",
-    )
-    col4.metric(
-        "下跌",
-        f"{n_negative} 只",
-        delta=f"占比 {n_negative / n_valid * 100:.0f}%" if n_valid > 0 else None,
-        delta_color="inverse",
-    )
-
-
-# ═══════════════════════════════════════════════════════════
-# 主入口
+# Section 13 — 主入口
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    """Streamlit 每日监控看板主函数。"""
-
-    # ── 解析命令行 ──
+    # ── CLI 参数 ──
     db_path = DEFAULT_DB_PATH
     for i, arg in enumerate(sys.argv):
         if arg == "--db-path" and i + 1 < len(sys.argv):
             db_path = Path(sys.argv[i + 1])
 
-    # ── 页面标题 ──
-    st.title("📊 Top 30 量化组合每日监控看板")
+    st.title("📊 Top 30 量化组合 · 每日风控看板")
 
-    # ── 登录 Baostock ──
-    login_placeholder = st.empty()
+    # ── Baostock 登录 ──
+    login_ph = st.empty()
     try:
         lg = bs.login()
         if lg.error_code != "0":
-            login_placeholder.error(
-                f"❌ Baostock 登录失败: [{lg.error_code}] {lg.error_msg}"
-            )
+            login_ph.error(f"❌ Baostock 登录失败 [{lg.error_code}] {lg.error_msg}")
             st.stop()
     except Exception as e:
-        login_placeholder.error(f"❌ Baostock 连接异常: {e}")
+        login_ph.error(f"❌ Baostock 连接异常: {e}")
         st.stop()
-
-    login_placeholder.success("⚡ Baostock 已连接")
+    login_ph.success("⚡ Baostock 已连接")
 
     try:
-        # ── Step 1: 获取最近交易日 ──
-        t_date, t1_date = get_latest_trade_dates()
+        # ────────────────────────────────────────────────
+        # Step 1: 交易日
+        # ────────────────────────────────────────────────
+        t_date, t1_date = get_trade_dates()
         if t_date is None:
-            st.warning(
-                "⚠️ 无法获取交易日列表，请检查 Baostock 服务是否正常。"
-            )
-            st.stop()
+            st.warning("⚠️ 无法获取交易日列表"); st.stop()
 
-        # ── 显示交易日期 ──
         today_str = date.today().strftime("%Y-%m-%d")
         if t_date < today_str:
-            st.info(
-                f"📅 最近交易日为 **{t_date}**（今日 {today_str} 为非交易日），"
-                f"以下数据基于最近交易日收盘价。"
-            )
+            st.info(f"📅 最近交易日 **{t_date}**（今日 {today_str} 非交易日）")
         else:
-            st.info(f"📅 交易日期: **{t_date}**")
+            st.info(f"📅 交易日期 **{t_date}**")
 
-        # ── Step 2: 获取持仓 ──
-        ym, positions = get_latest_positions(db_path, top_n=TOP_N)
+        # ────────────────────────────────────────────────
+        # Step 2: 持仓
+        # ────────────────────────────────────────────────
+        ym, positions = load_positions(db_path, TOP_N)
         if positions.empty:
-            st.warning(
-                f"⚠️ 未在 `{db_path}` 中找到有效持仓数据。\n\n"
-                "请确认：\n"
-                "1. 月末调仓流水线已运行至少一次\n"
-                "2. 数据库路径正确（可通过 `--db-path` 参数指定）"
-            )
-            st.stop()
+            st.warning(f"⚠️ 无持仓数据 (`{db_path}`)"); st.stop()
 
-        # ── Step 3: 拉取行情 ──
-        progress_placeholder = st.empty()
+        # ────────────────────────────────────────────────
+        # Step 3: 行情数据
+        # ────────────────────────────────────────────────
+        progress_ph = st.empty()
         all_symbols = positions["symbol"].tolist() + [BENCHMARK_SYMBOL]
 
-        prices_df = fetch_all_prices(
-            symbols=all_symbols,
-            t_date=t_date,
-            t1_date=t1_date,
-            progress_placeholder=progress_placeholder,
-        )
+        progress_ph.text(f"⏳ 正在拉取 T={t_date} 收盘价（{len(all_symbols)} 只标的）...")
+        t_prices = fetch_point_close(all_symbols, t_date)
+        t_prices = t_prices.rename(columns={"close": "close_t"})
 
-        # ── 检查数据有效性 ──
-        n_valid_close = prices_df["close_t"].notna().sum()
-        if n_valid_close == 0:
-            st.warning(
-                f"🔕 **今日无交易数据**\n\n"
-                f"T = {t_date} 的收盘价全部为空，可能原因：\n"
-                f"- 当日为非交易日（周末或节假日）\n"
-                f"- Baostock 数据尚未更新（请 18:00 后再试）"
-            )
-            st.stop()
+        if t1_date:
+            progress_ph.text(f"⏳ 正在拉取 T-1={t1_date} 收盘价...")
+            t1_prices = fetch_point_close(all_symbols, t1_date)
+            t1_prices = t1_prices.rename(columns={"close": "close_t_minus_1"})
+            prices_df = t_prices.merge(t1_prices, on="symbol", how="left")
+        else:
+            prices_df = t_prices.copy()
+            prices_df["close_t_minus_1"] = np.nan
+        progress_ph.empty()
 
-        # ── Step 4: 计算收益率 ──
-        returns_df = compute_returns(prices_df)
-        metrics = compute_portfolio_metrics(returns_df)
+        if prices_df["close_t"].notna().sum() == 0:
+            st.warning(f"🔕 T={t_date} 无交易数据（非交易日或数据未更新）"); st.stop()
 
-        # ── 合并信号强度，供全景表使用 ──
+        # ────────────────────────────────────────────────
+        # Step 4: 并行计算（在数据就绪后同时进行）
+        # ────────────────────────────────────────────────
+        # 4a. 单日收益 + KPI
+        returns_df = compute_daily_returns(prices_df)
+        metrics = compute_metrics(returns_df)
+
+        # 4b. 历史净值
+        with st.spinner("正在构建累计净值曲线..."):
+            nav_df = compute_cumulative_nav(db_path, positions["symbol"].tolist(), ym, t_date)
+
+        # 4c. 因子暴露
+        with st.spinner("正在计算风格因子暴露度..."):
+            exposures = compute_factor_exposures(positions["symbol"].tolist(), db_path, t_date)
+
+        # 4d. 风控扫描
+        name_map = fetch_stock_names(positions["symbol"].tolist())
+        alerts = scan_risk_events(returns_df, name_map, positions)
+
+        # 4e. 合并信号
         returns_df_merged = returns_df.merge(
-            positions[["symbol", "alpha_signal"]],
-            on="symbol",
-            how="left",
+            positions[["symbol", "alpha_signal"]], on="symbol", how="left",
         )
 
-        # ═══════════════════════════════════════════════════
-        # UI 渲染
-        # ═══════════════════════════════════════════════════
+        # ════════════════════════════════════════════
+        # UI 渲染管线
+        # ════════════════════════════════════════════
 
+        # ── 汇总行 ──
+        st.caption(
+            f"T={t_date} ｜ T-1={t1_date or 'N/A'} ｜ "
+            f"调仓月 {ym} ｜ 有效持仓 {metrics['n_stocks']}/{TOP_N}"
+        )
+
+        # 🔴 风控雷达（置顶）
+        render_risk_radar(alerts)
         st.divider()
 
-        # ── 日期 & 调仓信息汇总行 ──
-        st.caption(
-            f"T = {t_date}　|　T-1 = {t1_date or 'N/A'}　|　"
-            f"调仓基准月: {ym}　|　"
-            f"有效持仓: {metrics['n_stocks']}/{TOP_N} 只"
-        )
-
-        # ── KPI 卡片 ──
+        # 📊 KPI 卡片
         render_kpi_cards(metrics)
 
-        # ── 市场宽度 ──
+        # 📈 历史净值图
         st.divider()
-        st.markdown("### 📊 市场宽度 (Market Breadth)")
+        render_historical_nav(nav_df, ym)
+
+        # 🧬 风格因子暴露
+        st.divider()
+        render_factor_exposure(exposures)
+
+        # 📊 市场宽度
+        st.divider()
+        st.markdown("### 📊 市场宽度")
         render_market_breadth(metrics)
 
-        # ── 红黑榜 ──
+        # 🏆 红黑榜
         st.divider()
         st.markdown("### 🏆 红黑榜 — 极端波动监控")
         render_top_bottom(returns_df_merged)
 
-        # ── 全景持仓表 ──
+        # 📋 全景持仓
         st.divider()
-        render_full_table(returns_df_merged, positions, ym)
+        render_full_table(returns_df_merged, ym)
 
-        # ── 页脚 ──
+        # 页脚
         st.divider()
         st.caption(
-            f"数据来源: Baostock · 更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
-            f"数据库: `{db_path}`"
+            f"数据来源: Baostock + SQLite Market Cache · "
+            f"更新时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
+            f"`{db_path}`"
         )
 
     finally:
-        # ── 确保 Baostock 登出 ──
         bs.logout()
-        login_placeholder.empty()
+        login_ph.empty()
 
 
 if __name__ == "__main__":
