@@ -58,6 +58,9 @@ quant/
 │   ├── state_manager.py            # 信号锚点持久化 + 市场缓存 SQLite
 │   └── baostock_adapter.py         # Baostock PIT 财务数据适配 (零前看偏差)
 │
+├── monitoring/                      # 实盘监控看板
+│   └── daily_report.py             # ★ Streamlit 每日风控看板 (组合/基准/Alpha/因子暴露/风控雷达)
+│
 ├── output/                         # 回测输出 + ML 预测 + 报告
 │   ├── ml_v7_final_report.md       # ★ 最终消融报告 (V0 vs V5 vs V7)
 │   ├── factor_ic_summary.csv       # 因子 IC 汇总
@@ -89,6 +92,7 @@ quant/
 | `run_ml_lambdarank.py` | [归档] LambdaRank 回测 | 归档 |
 | `run_ml_turnover_aware.py` | [归档] V5 λ sweep 实验 | 归档 |
 | `run_timing_comparison.py` | 择时对比回测 — 有/无择时完整绩效对比 (NAV图+信号日志) | ★ 活跃 |
+| `monitoring/daily_report.py` | Streamlit 每日风控看板 — Top 30 组合 P&L / 因子暴露 / 风控雷达 | ★ 活跃 |
 | `diagnose_stock_pool.py` | 股票池诊断 — 采样方法对比 + 行业覆盖分析 | 工具 |
 
 ## 快速开始
@@ -114,6 +118,9 @@ python run_timing_comparison.py
 
 # 7. 纸交易 (每日 cron, 16:00 收盘后运行)
 python paper_trading/paper_trading_pipeline.py
+
+# 8. 每日风控看板 (Streamlit, 盘后 18:00 后)
+streamlit run monitoring/daily_report.py
 
 # 单元测试
 pytest tests/ -v
@@ -214,6 +221,32 @@ python run_timing_comparison.py
 > 回撤改善约 5.5pp 但收益腰斩。Sharpe 从 1.13 降至 0.80, 风险调整后收益恶化。
 > 该择时方案在当前参数下不具备实盘价值, 保留为基线供后续调参对比。
 > 2018 年触发率 96.2% (全年熊市几乎全空仓), 但也因此错失 2019 年初 V 型反弹。
+
+## 实盘监控看板
+
+每日盘后 (18:00) Streamlit 风控看板, 监控 Top 30 纸交易组合的实时表现:
+
+```bash
+streamlit run monitoring/daily_report.py
+```
+
+### 六大模块
+
+| 模块 | 内容 | 数据源 |
+|------|------|--------|
+| 🔴 **风控雷达** | 暴跌 (−7%) / ST 警示 / 疑似停牌 扫描 | Baostock 实时行情 |
+| 📊 **KPI 卡片** | 组合日收益 / 中证 500 基准 / 超额 Alpha | SQLite market_cache |
+| 📈 **累计净值** | 持有期组合 vs 基准 vs 累计超额三线图 | SQLite + Baostock 基准 |
+| 🧬 **因子暴露** | Size / Momentum / Value / Volatility 横截面百分位 | 基本面 parquet + 行情缓存 |
+| 🏆 **红黑榜** | 涨幅/跌幅 Top 3 柱状图 | 实时行情 |
+| 📋 **全景持仓** | 30 只全量明细表 + 日胜率进度条 | 实时行情 |
+
+### 技术亮点
+
+- **零前看偏差**: 财务数据通过 `pubDate` 门控做 PIT 对齐
+- **纯 Python 栈**: Streamlit + SQLite + Baostock, 无外部数据库依赖
+- **自动容错**: 数据缺失时优雅降级（显示 N/A 而非崩溃）
+- **缓存策略**: `st.cache_data` 5–10 分钟 TTL, 避免重复拉取行情
 
 ## ML 实验链 (V0 → V7)
 
