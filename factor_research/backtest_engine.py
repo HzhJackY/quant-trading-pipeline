@@ -24,23 +24,33 @@ logger = logging.getLogger(__name__)
 def combine_factors(
     factor_df: pd.DataFrame,
     factor_cols: list[str] | None = None,
-    method: str = "equal_weight",
+    method: str = "ic_weighted",
     return_col: str = "forward_return_1m",
     date_col: str = "date",
     max_correlation: float = 0.7,
     flip_sign: bool = True,
+    rolling_window: int = 24,
+    orthogonalize: bool = True,
+    min_factor_variance: float = 1e-10,
 ) -> pd.DataFrame:
     """
     多因子合成: 将多个标准化后的因子合并成一个复合分数。
 
     方法:
-    - equal_weight: 每个因子贡献一样 (稳健, 不overfit)
-    - ic_weighted: 用每个因子的 |IC_IR| 加权
+    - orthogonalize=True (默认): Gram-Schmidt 正交化 + 滚动 IC_IR 加权
+    - orthogonalize=False: 旧版贪心去冗余 + IC_IR 加权
 
-    可选优化:
-    - flip_sign=True: 自动翻转 IC 稳定为负的因子 (反转因子)
-    - max_correlation: 去冗余阈值 — 当两个因子相关性超过此值时,
-      只保留 |IC_IR| 更高的那个, 避免重复计算同一信号
+    正交化管线 (orthogonalize=True):
+      1. 计算 24 月滚动 |IC_IR|
+      2. 按 |IC_IR| 降序排列因子
+      3. Gram-Schmidt 正交化 (回归残差法)
+      4. |IC_IR| 加权合成, 完全共线因子自动权重归零
+
+    旧版管线 (orthogonalize=False):
+      1. 全样本 IC_IR 计算
+      2. 翻转负 IC_IR 因子
+      3. 贪心去冗余 (|corr| > max_correlation 的因子丢弃)
+      4. |IC_IR| 加权合成
     """
     from scipy.stats import spearmanr
 
@@ -61,6 +71,27 @@ def combine_factors(
     if not available:
         df["composite_factor"] = 0.0
         return df
+
+    # ═══════════════════════════════════════════════════════════
+    # 新版管线: Gram-Schmidt 正交化 + 滚动 IC_IR
+    # ═══════════════════════════════════════════════════════════
+    if orthogonalize and return_col in df.columns:
+        from factor_research.orthogonalization import apply_gram_schmidt_composite
+
+        return apply_gram_schmidt_composite(
+            df,
+            factor_cols=available,
+            return_col=return_col,
+            date_col=date_col,
+            rolling_window=rolling_window,
+            flip_sign=flip_sign,
+            min_factor_variance=min_factor_variance,
+            verbose=True,
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # 旧版管线: 贪心去冗余 + 全样本 IC_IR (backward compat)
+    # ═══════════════════════════════════════════════════════════
 
     # ── Step 1: 计算每个因子在全样本上的 IC_IR ──
     has_returns = return_col in df.columns
@@ -463,6 +494,7 @@ def run_backtest_with_costs(
     close_col: str = "收盘",
     amount_col: str = "成交额",
     vol_col: str = "Vol_20D",
+    timing_multipliers: dict[pd.Timestamp, float] | None = None,
 ) -> dict:
     """
     持仓级交易成本感知回测 (机构级 Net Sharpe Baseline)。
@@ -475,6 +507,12 @@ def run_backtest_with_costs(
          a. compute_drifted_weights(prev_weights, prev_period_returns)
          b. compute_split_universe_trade_cost(...)
          c. 净收益 = 毛收益 − 成本(占组合%)
+
+    择时乘数 (market timing):
+      - 如果 timing_multipliers 不为 None, 每期对 target weights 应用乘数
+      - 例: multiplier=0.3 → 每只股票权重从 1/N 降为 1/N × 0.3
+      - 注意: 上期的 prev_target_weights 也是缩放后的, 换手率自动反映
+      - 与 cost 的交互: Trade value 按缩放后权重计算 → 成本自然等比例缩小
 
     Logger 每期输出:
       [YYYY-MM] TO=XX% | LargeCost=XXbps | SmallCost=XXbps | NetRet=XX%
@@ -601,9 +639,18 @@ def run_backtest_with_costs(
         n_holdings = len(curr_holdings)
         curr_target_weights = pd.Series(1.0 / n_holdings, index=curr_holdings.index)
 
-        # ── 当期毛收益 ──
+        # ── 择时乘数: 获取当前期仓位缩放因子 ──
+        timing_mult = 1.0
+        if timing_multipliers is not None:
+            timing_mult = timing_multipliers.get(pd.Timestamp(dt), 1.0)
+            if timing_mult < 1.0:
+                logger.info("  [择时] %s → 仓位乘数=%.1f (30%% in stocks, 70%% cash)",
+                             str(dt)[:7], timing_mult)
+
+        # ── 当期毛收益 (择时: 现金部分收益为 0) ──
         curr_forward_rets = curr_holdings[return_col].astype(float)
-        gross_ret = float((curr_target_weights * curr_forward_rets).sum())
+        gross_ret_100 = float((curr_target_weights * curr_forward_rets).sum())
+        gross_ret = timing_mult * gross_ret_100
 
         # ── 计算成本和净收益 ──
         # 成交额: fillna 用中位数 (个别股票可能缺失)
@@ -625,19 +672,27 @@ def run_backtest_with_costs(
             # 非首期: 漂移 + 换仓成本
             uni_map = curr_holdings[universe_col]
 
-            # 价格漂移
+            # 价格漂移 (weights 始终用 100% 计算, 择时只影响敞口)
             drifted = compute_drifted_weights(prev_target_weights, prev_forward_returns)
 
             cost_info = compute_split_universe_trade_cost(
                 curr_target_weights, drifted, uni_map, cost_model, amts, daily_vols,
             )
 
+        # 择时成本缩放: 实际交易规模 = timing_mult × 全仓交易规模
+        if timing_mult < 1.0:
+            for _key in ("total_cost_pct", "total_cost_bps",
+                         "large_cost_bps", "small_cost_bps", "oneway_turnover"):
+                if _key in cost_info and cost_info[_key] is not None:
+                    cost_info[_key] *= timing_mult
+
         net_ret = gross_ret - cost_info["total_cost_pct"]
 
         # ── Logger 输出 ──
+        mult_tag = f" | Mult={timing_mult:.1f}" if timing_mult < 1.0 else ""
         logger.info(
             "[%s] TO=%.1f%% | LargeCost=%.1fbps | SmallCost=%.1fbps | "
-            "Gross=%.3f%% | Net=%.3f%% | N=%d",
+            "Gross=%.3f%% | Net=%.3f%% | N=%d%s",
             str(dt)[:10],
             cost_info["oneway_turnover"] * 100,
             cost_info["large_cost_bps"],
@@ -645,6 +700,7 @@ def run_backtest_with_costs(
             gross_ret * 100,
             net_ret * 100,
             n_holdings,
+            mult_tag,
         )
 
         # ── 保存 ──

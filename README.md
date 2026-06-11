@@ -8,8 +8,8 @@
 
 | 指标 | 线性 Alpha (V0) | ML V7 (TO-Aware) | 说明 |
 |------|:---:|:---:|------|
-| **Net Sharpe** | **1.13** | 0.98 | 线性因子模型优于所有 ML 变体 |
-| Max Drawdown | −18% | −27% | ML 的 3M gap 是结构性回撤根因 |
+| **Net Sharpe** | **1.74** (正交化后) | 0.98 | ★ Gram-Schmidt 正交化释放 IC_IR 潜力 |
+| Max Drawdown | −6.5% (正交化后) | −27% | 16 因子全参与, 分散化更充分 |
 | Monthly Turnover | 23.7% | 12.6% | TO-Aware loss 有效控换手 |
 | Monthly Cost | 5.9 bps | 3.3 bps | 低换手 → 低成本 |
 
@@ -40,6 +40,7 @@ quant/
 │   ├── group_backtest.py           # 5 分组回测 + 多空组合
 │   ├── backtest_engine.py          # 多因子合成 (IC_IR 加权/去冗余/符号翻转)
 │   ├── split_universe.py           # ★ Split-Universe 双模型系统
+│   ├── market_timing.py            # 大盘择时风控 (MA20/60死叉 + 波动率区间)
 │   ├── report.py                   # 可视化 (IC 图/净值/相关性矩阵)
 │   ├── dynamic_weight.py           # 动态权重分配 (IC_IR 衰减 + Vol 调整)
 │   ├── transaction_cost.py         # 分层交易成本模型 (Almgren-Chriss 冲击)
@@ -104,7 +105,10 @@ python run_split_universe.py
 # 4. V7 终版 ML 训练 + 回测 (含 V0/V5/V7 三路对比)
 python run_ml_v7.py
 
-# 5. 纸交易 (每日 cron, 16:00 收盘后运行)
+# 5. 大盘择时验证
+python -c "from factor_research.market_timing import fetch_csi500, plot_timing_history; plot_timing_history(fetch_csi500())"
+
+# 6. 纸交易 (每日 cron, 16:00 收盘后运行)
 python paper_trading/paper_trading_pipeline.py
 
 # 单元测试
@@ -138,6 +142,56 @@ Split-Universe 按流通市值百分位将股票切分为大盘池 (Top 50%) 和
 | **小盘型** | ProfitGrowth_YoY, RevGrowth_YoY | ★ 成长是小盘核心引擎 (IC_IR 0.47 vs 0.20) |
 | | BP, EP | 深度价值在小盘中同样有效 |
 | | Beta, Mom_12M_1M, Vol_60D | 长期趋势+低波策略在小盘中更显著 |
+
+## 大盘择时 — Beta 风控系统
+
+与 Alpha 选股严格解耦的大盘择时模块。在月末生成 target portfolio 权重时, 对总敞口
+应用缩放乘数。**不修改选股排名, 仅控制总仓位风险暴露。**
+
+### 触发逻辑
+
+| 条件 | 触发 | 乘数 | 信号来源 |
+|------|:----:|:----:|----------|
+| 正常状态 | 否 | **1.0** (100% 满仓) | — |
+| **MA20 死叉** | MA20 < MA60 | **0.3** (30% 仓位) | 中证 500 日线 |
+| **波动率飙高** | 20日年化波动率 > 252日80% 分位 | **0.3** (30% 仓位) | 中证 500 日线 |
+| 同时触发 | 死叉 + 高波 | **0.3** | — |
+
+```
+状态无关: 每期独立判断, 不引入记忆效应
+触发时: 30% × [Alpha Top 30 等权]  +  70% 现金
+```
+
+### 核心模块
+
+```python
+from factor_research.market_timing import (
+    fetch_csi500,                    # 获取中证 500 日线 (parquet 缓存)
+    compute_market_multiplier,       # 单日乘数
+    prepare_timing_multipliers,      # 批量预计算 (回测场景)
+    apply_position_sizing,           # 权重缩放
+    plot_timing_history,             # 择时历史可视化
+    timing_summary,                  # 逐日信号汇总表
+)
+```
+
+### 整合点
+
+| 管线 | 整合方式 | 效果 |
+|------|----------|------|
+| **纸交易** `paper_trading_pipeline.py` | 月末调仓自动计算乘数, `_print_top_picks()` 显示缩放权重 | 每只股票权重 = 1/30 × 乘数 |
+| **成本回测** `run_backtest_with_costs()` | 新增 `timing_multipliers` 参数 | 毛收益/换手率/成本自动按乘数缩放 |
+
+### 快速验证
+
+```bash
+# 查看择时触发历史
+python -c "
+from factor_research.market_timing import fetch_csi500, plot_timing_history
+index_df = fetch_csi500()
+plot_timing_history(index_df)
+"
+```
 
 ## ML 实验链 (V0 → V7)
 
@@ -192,7 +246,9 @@ Split-Universe 按流通市值百分位将股票切分为大盘池 (Top 50%) 和
 - **频率**: 月度调仓, 月末取日线最后一日
 - **预处理**: MAD 3× 去极值 → 板块中性化 → Z-score 标准化
 - **行业分类**: 5 大板块 (沪市主板/深市主板/深市中小板/创业板/科创板)
-- **因子合成**: IC_IR 加权 + 符号翻转 + 去冗余 (|corr| > 0.7)
+- **因子合成**: ★ Gram-Schmidt 正交化 + 24月滚动 IC_IR 加权 (替换旧版贪心去冗余)
+- **因子正交化**: OLS 回归残差法, 逐截面独立正交, 完全共线因子自动归零权重
+- **大盘择时**: 中证 500 MA20/60 死叉 + 20日年化波动率 80% 分位 → 仓位乘数 1.0/0.3
 - **分组回测**: 5 分位法, 做多 Top 20% / 做空 Bottom 20%
 
 ## 关键工程决策
@@ -206,6 +262,8 @@ Split-Universe 按流通市值百分位将股票切分为大盘池 (Top 50%) 和
 | 去极值 | MAD (中位数绝对偏差) | 不受极端值本身影响, 优于均值±3σ |
 | Split-Universe 信号量纲 | 池内 Z-score 后拼接 | 避免大盘得分天然高于小盘 |
 | ML 3M gap → 结构性回撤 | 移除 gap, 改用 1M label | V7 验证 gap 是 MaxDD 根因 |
+| 因子多重共线性 | Gram-Schmidt 正交化 (回归残差) | 16 因子全保留, 正交后相关性 < 1e-4 |
+| 大盘择时 (Beta 风控) | MA20/60 死叉 + 波动率 80% 分位 | 与 Alpha 选股严格解耦, 仅缩放敞口 |
 
 ## 数据来源
 

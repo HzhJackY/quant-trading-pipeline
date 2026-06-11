@@ -35,6 +35,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from data.cleaner import winsorize_mad, standardize_cross_section
+from factor_research.orthogonalization import apply_gram_schmidt_composite
 
 # ── Logger 配置 ──────────────────────────────────────────
 logger = logging.getLogger("split_universe")
@@ -109,6 +110,8 @@ class SplitUniverseModel:
         date_col: str = "date",
         symbol_col: str = "symbol",
         return_col: str = "forward_return_1m",
+        orthogonalize: bool = True,
+        rolling_window: int = 24,
     ):
         self.panel = panel.copy()
         self.factor_cols = [c for c in factor_cols if c in panel.columns]
@@ -116,6 +119,8 @@ class SplitUniverseModel:
         self.date_col = date_col
         self.symbol_col = symbol_col
         self.return_col = return_col
+        self.orthogonalize = orthogonalize
+        self.rolling_window = rolling_window
 
         # ── 推断已有标准化列 ──
         self._neutral_z_available = any(
@@ -545,28 +550,38 @@ class SplitUniverseModel:
         min_ic_ir: float = 0.05,
         max_correlation: float = 0.7,
         universe_name: str = "",
+        orthogonalize: bool | None = None,
+        rolling_window: int | None = None,
     ) -> tuple[pd.DataFrame, list[str]]:
         """
-        为单个子域构建 IC_IR 加权复合信号。
+        为单个子域构建复合信号。
 
-        流程:
-          1. 筛选 IC_IR > min_ic_ir 的因子 (排除噪声因子)
+        orthogonalize=True → Gram-Schmidt 正交化 + 滚动 IC_IR 加权
+        orthogonalize=False → 旧版贪心去冗余 + 全样本 IC_IR 加权
+
+        管线:
+          1. 筛选 |IC_IR| > min_ic_ir 的因子 (排除噪声因子)
           2. 符号翻转: 负 IC_IR 因子取反 (如反转因子)
-          3. 去冗余: 贪婪算法移除 |correlation| > max_correlation 的因子
-          4. IC_IR 加权: weight_i = |IC_IR_i| / sum(|IC_IR|)
-
-        参数
-        ----
-        panel : 子域面板 (含标准化因子列)
-        ic_results : Step 2 输出的该子域 IC 结果
-        min_ic_ir : 最低 |IC_IR| 阈值, 低于此值的因子不参与合成
-        max_correlation : 去冗余的相关系数上限
-        universe_name : 子域名称 (仅用于日志)
-
-        返回
-        ----
-        (panel_with_composite, selected_factor_names)
+          3. 去冗余 (旧版) 或 Gram-Schmidt 正交化 (新版)
+          4. IC_IR 加权合成
         """
+        # ── 正交化/滚动参数 ──
+        if orthogonalize is None:
+            orthogonalize = self.orthogonalize
+        if rolling_window is None:
+            rolling_window = self.rolling_window
+
+        # ═══════════════════════════════════════════════════════════
+        # 新版: Gram-Schmidt 正交化 + 滚动 IC_IR
+        # ═══════════════════════════════════════════════════════════
+        if orthogonalize:
+            return self._build_sub_model_gram_schmidt(
+                panel, ic_results, min_ic_ir, universe_name, rolling_window,
+            )
+
+        # ═══════════════════════════════════════════════════════════
+        # 旧版: 贪心去冗余 + 全样本 IC_IR (backward compat)
+        # ═══════════════════════════════════════════════════════════
         logger.info(
             "  [%s模型] 筛选因子: |IC_IR| > %.2f, |corr| < %.1f",
             universe_name, min_ic_ir, max_correlation,
@@ -683,6 +698,78 @@ class SplitUniverseModel:
             )
 
         return panel, kept
+
+    def _build_sub_model_gram_schmidt(
+        self,
+        panel: pd.DataFrame,
+        ic_results: dict[str, dict],
+        min_ic_ir: float = 0.05,
+        universe_name: str = "",
+        rolling_window: int = 24,
+    ) -> tuple[pd.DataFrame, list[str]]:
+        """
+        Gram-Schmidt 正交化版子模型构建 (内部方法)。
+
+        流程:
+          1. 将 raw factor names 解析为实际列名 (如 BP → BP_neutral_z)
+          2. 确保 forward_return 在 panel 中可用
+          3. 调用 apply_gram_schmidt_composite() 完成全部计算
+        """
+        # 1. 解析因子列名
+        actual_cols: list[str] = []
+        raw_to_actual: dict[str, str] = {}
+        for fn in self.factor_cols:
+            actual = self._get_factor_col(fn)
+            if actual in panel.columns:
+                actual_cols.append(actual)
+                raw_to_actual[fn] = actual
+
+        if not actual_cols:
+            panel = panel.copy()
+            panel["composite_score"] = 0.0
+            return panel, []
+
+        # 2. 确保 forward_return 存在
+        if self.return_col not in panel.columns:
+            fwd = self.panel[[self.date_col, self.symbol_col, self.return_col]].dropna()
+            panel = panel.merge(fwd, on=[self.date_col, self.symbol_col], how="left")
+
+        # 3. 检查 forward_return 是否仍然缺失
+        if self.return_col not in panel.columns or panel[self.return_col].isna().all():
+            logger.warning("    [%s] forward_return 不可用, 回退等权", universe_name)
+            panel = panel.copy()
+            panel["composite_score"] = panel[actual_cols].mean(axis=1, skipna=True)
+            return panel, actual_cols
+
+        # 4. 调用 Gram-Schmidt 管线
+        logger.info(
+            "  [%s模型] Gram-Schmidt 正交化 (滚动 %d 期 IC_IR, %d 个因子)",
+            universe_name, rolling_window, len(actual_cols),
+        )
+
+        result = apply_gram_schmidt_composite(
+            panel,
+            factor_cols=actual_cols,
+            return_col=self.return_col,
+            date_col=self.date_col,
+            rolling_window=rolling_window,
+            flip_sign=True,
+            min_factor_variance=1e-10,
+            min_ic_ir=min_ic_ir,
+            verbose=(len(logger.handlers) > 0),
+        )
+
+        panel = panel.copy()
+        panel["composite_score"] = result["composite_factor"]
+
+        # 记录实际被使用的因子
+        used_cols = [c for c in actual_cols if c in result.columns]
+        logger.info(
+            "    [%s模型] 正交化完成: %d 个因子参与合成",
+            universe_name, len(used_cols),
+        )
+
+        return panel, used_cols
 
     def train_models(
         self,
@@ -1023,6 +1110,8 @@ def run_split_universe_analysis(
     factor_cols: list[str],
     percentile: float = 0.5,
     output_dir: str = "output",
+    orthogonalize: bool = True,
+    rolling_window: int = 24,
 ) -> SplitUniverseResult:
     """
     一键运行 Split-Universe 分析。
@@ -1033,6 +1122,8 @@ def run_split_universe_analysis(
     factor_cols : 因子列名
     percentile : 市值切割阈值
     output_dir : 输出目录
+    orthogonalize : 是否使用 Gram-Schmidt 正交化
+    rolling_window : IC_IR 滚动窗口期数
 
     返回
     ----
@@ -1042,6 +1133,8 @@ def run_split_universe_analysis(
         panel=panel,
         factor_cols=factor_cols,
         percentile=percentile,
+        orthogonalize=orthogonalize,
+        rolling_window=rolling_window,
     )
     result = model.run_pipeline()
 

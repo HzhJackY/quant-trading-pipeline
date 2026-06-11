@@ -88,6 +88,9 @@ from paper_trading.factor_compute import (
 # ── Production engine ──
 from factor_research.production_engine import ProductionAlphaEngine, ProductionConfig
 
+# ── Market timing ──
+from factor_research.market_timing import fetch_csi500, compute_market_multiplier
+
 logger = logging.getLogger("paper_trading")
 if not logger.handlers:
     h = logging.StreamHandler()
@@ -147,6 +150,7 @@ class PaperTradingPipeline:
         self._state.init()
         self._engine: Optional[ProductionAlphaEngine] = None
         self._universe: Optional[pd.DataFrame] = None
+        self._index_df: Optional[pd.DataFrame] = None  # CSI 500 cache for market timing
 
     # ── Main Entry Point ──────────────────────────────────
 
@@ -329,12 +333,16 @@ class PaperTradingPipeline:
             "alpha_signal": signals,
         }).sort_values("alpha_signal", ascending=False).reset_index(drop=True)
 
-        self._print_top_picks(signal_df, ym)
+        # 择时乘数 (基于中证 500 MA20/MA60 + 波动率区间)
+        timing_mult = self._compute_timing_multiplier(current_date)
+        self._print_top_picks(signal_df, ym, timing_multiplier=timing_mult)
         self._state.write_signal_anchor(ym, signal_df.set_index("symbol")["alpha_signal"])
         self._print_state_stats()
 
+        mult_tag = f" | 择时乘数={timing_mult:.1f}" if timing_mult < 1.0 else ""
         logger.info("=" * 64)
-        logger.info("[OK] Month-end rebalance complete — %s | %d stocks processed", ym, len(signal_df))
+        logger.info("[OK] Month-end rebalance complete — %s | %d stocks processed%s",
+                     ym, len(signal_df), mult_tag)
         logger.info("=" * 64)
 
     # ═══════════════════════════════════════════════════════
@@ -471,32 +479,55 @@ class PaperTradingPipeline:
                      self._engine._n_folds, self._engine.seeds)
         return self._engine
 
-    def _print_top_picks(self, signal_df: pd.DataFrame, ym: str):
-        """Display top N buy targets with signal strength."""
+    def _print_top_picks(
+        self,
+        signal_df: pd.DataFrame,
+        ym: str,
+        timing_multiplier: float = 1.0,
+    ):
+        """
+        Display top N buy targets with signal strength and position sizing.
+
+        timing_multiplier: Market timing scale factor.
+          - 1.0 → full allocation (each stock = 1/N)
+          - 0.3 → reduced allocation (each stock = 0.3/N, rest in cash)
+        """
         n = min(self.config.top_n, len(signal_df))
         top = signal_df.head(n)
+        weight_per_stock = timing_multiplier / n  # e.g., 0.3/30 = 0.01
 
         print(f"\n{'='*72}")
         print(f"   TOP {n} BUY TARGETS — {ym}")
+        if timing_multiplier < 1.0:
+            print(f"   {'='*68}")
+            print(f"   ⚠  MARKET TIMING TRIGGERED — 仓位乘数={timing_multiplier:.1f}")
+            print(f"   Total equity exposure: {timing_multiplier:.0%} | "
+                  f"Cash reserve: {1-timing_multiplier:.0%}")
+            print(f"   {'='*68}")
         print(f"{'='*72}")
-        print(f"  {'Rank':<6} {'Symbol':<10} {'Signal':>8}")
-        print(f"  {'-'*24}")
+        print(f"  {'Rank':<6} {'Symbol':<10} {'Signal':>8}  {'Weight':>7}  {'Indicative $':>12}")
+        print(f"  {'-'*49}")
 
         for rank, (_, row) in enumerate(top.iterrows(), 1):
-            # Visual bar: ####.... proportional to signal
             bar_len = int(row["alpha_signal"] * 20)
             bar = "#" * bar_len + "." * (20 - bar_len)
-            print(f"  {rank:<6} {row['symbol']:<10} {row['alpha_signal']:>8.4f}  {bar}")
+            # Indicative dollar per stock per $1M AUM
+            indicative = weight_per_stock * 1_000_000
+            print(f"  {rank:<6} {row['symbol']:<10} {row['alpha_signal']:>8.4f}  "
+                  f"{weight_per_stock:>7.4f}  ${indicative:>10,.0f}  {bar}")
 
         # Distribution stats
         bottom = signal_df.tail(n)
-        print(f"\n  {'─'*24}")
-        print(f"  Top {n} mean signal:   {top['alpha_signal'].mean():.4f}")
-        print(f"  Bottom {n} mean signal: {bottom['alpha_signal'].mean():.4f}")
-        print(f"  Spread (Top - Bottom):  {top['alpha_signal'].mean() - bottom['alpha_signal'].mean():.4f}")
+        total_equity_pct = timing_multiplier * 100
+        print(f"\n  {'─'*49}")
+        print(f"  Top {n} mean signal:     {top['alpha_signal'].mean():.4f}")
+        print(f"  Bottom {n} mean signal:  {bottom['alpha_signal'].mean():.4f}")
+        print(f"  Signal Spread:           {top['alpha_signal'].mean() - bottom['alpha_signal'].mean():.4f}")
         print(f"  Universe: {len(signal_df)} stocks | "
               f"Median: {signal_df['alpha_signal'].median():.4f} | "
               f"Std: {signal_df['alpha_signal'].std():.4f}")
+        print(f"  Portfolio: {n} stocks × {weight_per_stock:.4f} = "
+              f"{total_equity_pct:.0f}% equity / {1-timing_multiplier:.0%} cash")
         print(f"{'='*72}\n")
 
     def _print_state_stats(self):
@@ -507,6 +538,35 @@ class PaperTradingPipeline:
             stats["market_rows"], stats["market_dates"],
             stats["signal_months"], stats["latest_signal_ym"] or "none",
         )
+
+    # ═══════════════════════════════════════════════════════════
+    # Market Timing Helpers
+    # ═══════════════════════════════════════════════════════════
+
+    def _compute_timing_multiplier(self, current_date: date) -> float:
+        """
+        Compute the market timing position sizing multiplier.
+
+        Fetches CSI 500 data (cached across calls), computes MA20/MA60
+        death cross and volatility regime.
+
+        Returns:
+            float: 0.3 (triggered) or 1.0 (normal).
+        """
+        if self._index_df is None:
+            start = (current_date - timedelta(days=700)).isoformat()
+            try:
+                self._index_df = fetch_csi500(start_date=start, use_cache=True)
+            except Exception as e:
+                logger.warning("[择时] fetch_csi500 failed: %s — defaulting to 1.0", e)
+                return 1.0
+
+        try:
+            mult = compute_market_multiplier(self._index_df, current_date)
+            return mult
+        except Exception as e:
+            logger.warning("[择时] compute_market_multiplier failed: %s — defaulting to 1.0", e)
+            return 1.0
 
 
 # ═══════════════════════════════════════════════════════════

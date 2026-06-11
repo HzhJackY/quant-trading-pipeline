@@ -10,10 +10,13 @@ Split-Universe 双模型系统 — 运行脚本。
 
 import logging
 import sys
+import warnings
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
+from scipy.stats import ConstantInputWarning
+warnings.filterwarnings("ignore", category=ConstantInputWarning)
 
 # 配置日志
 logging.basicConfig(
@@ -117,12 +120,12 @@ def run_baseline_backtest(panel: pd.DataFrame) -> dict:
             ic_results[name] = summary
             print(f"    {name:20s} IC_IR={summary.get('IC_IR', 0):+.4f}")
 
-    # 复合因子
-    print(f"\n  多因子合成 (IC_IR 加权)")
+    # 复合因子 — Gram-Schmidt 正交化 + 滚动 IC_IR 加权
+    print(f"\n  多因子合成 Gram-Schmidt 正交化 (滚动24月IC_IR)")
     combined = combine_factors(
         panel, factor_cols=factor_z_cols, method="ic_weighted",
         return_col="forward_return_1m", date_col="date",
-        max_correlation=0.7, flip_sign=True,
+        flip_sign=True, orthogonalize=True, rolling_window=24,
     )
 
     # 分层回测
