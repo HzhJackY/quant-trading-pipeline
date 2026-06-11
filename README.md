@@ -88,6 +88,7 @@ quant/
 | `run_ml_ablation.py` | [归档] V0-V3 早期消融实验 | 归档 |
 | `run_ml_lambdarank.py` | [归档] LambdaRank 回测 | 归档 |
 | `run_ml_turnover_aware.py` | [归档] V5 λ sweep 实验 | 归档 |
+| `run_timing_comparison.py` | 择时对比回测 — 有/无择时完整绩效对比 (NAV图+信号日志) | ★ 活跃 |
 | `diagnose_stock_pool.py` | 股票池诊断 — 采样方法对比 + 行业覆盖分析 | 工具 |
 
 ## 快速开始
@@ -108,7 +109,10 @@ python run_ml_v7.py
 # 5. 大盘择时验证
 python -c "from factor_research.market_timing import fetch_csi500, plot_timing_history; plot_timing_history(fetch_csi500())"
 
-# 6. 纸交易 (每日 cron, 16:00 收盘后运行)
+# 6. 择时对比回测 (有/无择时完整绩效对比)
+python run_timing_comparison.py
+
+# 7. 纸交易 (每日 cron, 16:00 收盘后运行)
 python paper_trading/paper_trading_pipeline.py
 
 # 单元测试
@@ -191,7 +195,25 @@ from factor_research.market_timing import fetch_csi500, plot_timing_history
 index_df = fetch_csi500()
 plot_timing_history(index_df)
 "
+
+# 择时对比回测 (有/无择时完整绩效对比)
+python run_timing_comparison.py
 ```
+
+### 择时回测基线 (2017–2024, 96 期)
+
+| 指标 | 无择时 | 有择时 | 变化 |
+|------|:-----:|:-----:|:----:|
+| Net Sharpe | **1.13** | 0.80 | −0.33 |
+| 年化收益 | **21.27%** | 10.66% | −10.61% |
+| 最大回撤 | −18.01% | **−12.50%** | +5.51% |
+| 月均换手 | 23.7% | 14.3% | −9.4% |
+| 月均成本 | 5.9 bps | 3.4 bps | −2.4 bps |
+
+> **诚实结论**: 当前参数 (MA20/60 死叉 + 波动率 80% 分位 → 0.3 乘数) 触发率 59%,
+> 回撤改善约 5.5pp 但收益腰斩。Sharpe 从 1.13 降至 0.80, 风险调整后收益恶化。
+> 该择时方案在当前参数下不具备实盘价值, 保留为基线供后续调参对比。
+> 2018 年触发率 96.2% (全年熊市几乎全空仓), 但也因此错失 2019 年初 V 型反弹。
 
 ## ML 实验链 (V0 → V7)
 
