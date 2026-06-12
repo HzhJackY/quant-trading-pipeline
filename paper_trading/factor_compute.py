@@ -63,6 +63,109 @@ FACTOR_NAMES = [
 
 
 # ═══════════════════════════════════════════════════════════
+# Stage 0: Risk Pre-Filters (applied BEFORE factor computation)
+# ═══════════════════════════════════════════════════════════
+
+def apply_risk_filters(
+    market_df: pd.DataFrame,
+    fundamentals_df: pd.DataFrame,
+    *,
+    min_avg_amount_20d: float = 50_000_000,   # 5000 万
+    min_total_mcap: float = 5_000_000_000,      # 50 亿
+) -> set[str]:
+    """
+    Apply hard risk filters BEFORE factor ranking.
+
+    Filters (in order):
+      1. ST / *ST removal (name-based)
+      2. Suspension removal (no close data on latest trade date)
+      3. Liquidity filter: 20-day average turnover < min_avg_amount_20d
+      4. Market cap filter: total_mcap < min_total_mcap
+
+    Args:
+        market_df: Market cache data (multi-day OHLCV).
+        fundamentals_df: Latest fundamentals snapshot.
+
+    Returns:
+        Set of 6-digit symbol strings that PASS all filters.
+    """
+    valid = set(market_df["symbol"].unique())
+
+    # ── 1. ST / *ST filter ──
+    if "name" in fundamentals_df.columns:
+        st_mask = fundamentals_df["name"].str.contains(r"\*?ST", na=False, regex=True)
+        st_symbols = set(fundamentals_df.loc[st_mask, "symbol"])
+        n_st = len(st_symbols & valid)
+        valid -= st_symbols
+        if n_st > 0:
+            logger.info("  [RiskFilter] Removed %d ST/*ST stocks", n_st)
+
+    # ── 2. Suspension filter (no trading data on recent dates) ──
+    # NOTE: Don't check only the single latest date — market cache may have
+    # partial data for the most recent day (ingestion in progress / holiday).
+    # Instead, require close data on at least ONE of the last 5 trading dates.
+    if "trade_date" in market_df.columns and "close" in market_df.columns:
+        recent_dates = sorted(market_df["trade_date"].unique())[-5:]
+        if len(recent_dates) > 0:
+            recent_data = market_df[
+                market_df["trade_date"].isin(recent_dates)
+            ].dropna(subset=["close"])
+            active_in_window = set(recent_data["symbol"].unique())
+            n_suspended = len(valid - active_in_window)
+            valid &= active_in_window
+            if n_suspended > 0:
+                logger.info(
+                    "  [RiskFilter] Removed %d suspended stocks "
+                    "(no close data in last %d trading days: %s ~ %s)",
+                    n_suspended, len(recent_dates),
+                    str(recent_dates[0])[:10], str(recent_dates[-1])[:10],
+                )
+
+    # ── 3. Liquidity filter: avg daily amount over available recent days ──
+    if "amount" in market_df.columns:
+        mkt_sorted = market_df.sort_values(["symbol", "trade_date"])
+        # Use up to 20 most recent days per stock (min 5 days required)
+        recent_amount = (
+            mkt_sorted.groupby("symbol")
+            .tail(20)
+            .groupby("symbol")["amount"]
+            .agg(["mean", "count"])
+        )
+        # Only filter stocks with >= 5 days of data (avoid false positives
+        # for newly added stocks with incomplete cache)
+        recent_amount = recent_amount[recent_amount["count"] >= 5]
+        illiquid = set(
+            recent_amount[recent_amount["mean"] < min_avg_amount_20d].index
+        )
+        n_illiquid = len(illiquid & valid)
+        valid -= illiquid
+        if n_illiquid > 0:
+            logger.info(
+                "  [RiskFilter] Removed %d low-liquidity stocks "
+                "(avg daily amount < %.0f万, min 5 trading days)",
+                n_illiquid, min_avg_amount_20d / 1e4,
+            )
+
+    # ── 4. Market cap filter ──
+    if "total_mcap" in fundamentals_df.columns:
+        micro_cap = set(
+            fundamentals_df.loc[
+                fundamentals_df["total_mcap"] < min_total_mcap, "symbol"
+            ]
+        )
+        n_micro = len(micro_cap & valid)
+        valid -= micro_cap
+        if n_micro > 0:
+            logger.info(
+                "  [RiskFilter] Removed %d micro-cap stocks "
+                "(total_mcap < %.0f亿)", n_micro, min_total_mcap / 1e8
+            )
+
+    logger.info("  [RiskFilter] %d stocks pass all pre-filters", len(valid))
+    return valid
+
+
+# ═══════════════════════════════════════════════════════════
 # Stage 1: Raw Factor Computation
 # ═══════════════════════════════════════════════════════════
 
@@ -432,6 +535,7 @@ def compute_feature_matrix(
     pit_financials: pd.DataFrame | None = None,
     industry_map: pd.Series | None = None,
     factor_names: list[str] | None = None,
+    universe_symbols: set[str] | None = None,
 ) -> pd.DataFrame:
     """
     Compute the full feature matrix for ONE cross-section.
@@ -440,11 +544,12 @@ def compute_feature_matrix(
     columns that ProductionAlphaEngine.predict_cross_section() requires.
 
     Pipeline:
+      0. Restrict to universe_symbols (CSI 800) if provided
       1. Compute 16 raw factors from 60-day market cache + fundamentals
          (with PIT-gated financial data for balance-sheet factors)
       2. Industry-neutralize using SW industry classification
       3. Cross-sectional z-score → _neutral_z
-      4. Cross-sectional rank → _neutral_z_rank
+      4. Cross-sectional rank → _neutral_z_rank (WITHIN restricted universe)
       5. Return only _neutral_z_rank columns + symbol
 
     Args:
@@ -456,6 +561,10 @@ def compute_feature_matrix(
         industry_map: pd.Series index=symbol, values=SW industry_name.
             If None, uses "全市场" (global mean only, no industry differentiation).
         factor_names: Subset of factors to compute. Default: all 16.
+        universe_symbols: If provided, ONLY these symbols are kept for factor
+            computation and cross-sectional ranking. This forces the rank
+            distribution to match the training universe (CSI 800).
+            Must be a set of 6-digit string codes.
 
     Returns:
         pd.DataFrame with cols [symbol, {factor}_neutral_z_rank, ...]
@@ -463,6 +572,27 @@ def compute_feature_matrix(
     """
     if factor_names is None:
         factor_names = list(FACTOR_NAMES)
+
+    # ── Step 0: Restrict to CSI 800 universe (BEFORE any ranking) ──
+    if universe_symbols is not None and len(universe_symbols) > 0:
+        market_cache_df = market_cache_df[
+            market_cache_df["symbol"].isin(universe_symbols)
+        ].copy()
+        fundamentals_df = fundamentals_df[
+            fundamentals_df["symbol"].isin(universe_symbols)
+        ].copy()
+
+        if len(market_cache_df) == 0:
+            logger.error(
+                "Universe restriction left ZERO stocks! "
+                "Check CSI 800 component list vs market cache overlap."
+            )
+            return pd.DataFrame(columns=["symbol"])
+
+        logger.info(
+            "  Universe restricted: %d symbols in CSI 800 ∩ market data",
+            market_cache_df["symbol"].nunique(),
+        )
 
     logger.info("Computing feature matrix | %d factors | %d rows cache | %d stocks fundamentals",
                 len(factor_names), len(market_cache_df), len(fundamentals_df))

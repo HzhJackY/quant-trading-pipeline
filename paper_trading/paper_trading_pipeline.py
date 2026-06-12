@@ -68,6 +68,7 @@ from paper_trading.data_ingestion import (
     fetch_daily_fundamentals,
     fetch_daily_fundamentals_parallel,
     fetch_all_a_share_codes,
+    fetch_csi800_members,
     fetch_and_align_financials,
     fetch_industry_classification,
     is_trade_date,
@@ -80,6 +81,7 @@ from paper_trading.state_manager import (
     prev_ym,
 )
 from paper_trading.factor_compute import (
+    apply_risk_filters,
     compute_feature_matrix,
     validate_feature_columns,
     FACTOR_NAMES,
@@ -251,9 +253,60 @@ class PaperTradingPipeline:
         ym = ym_from_date(current_date)
         prev = prev_ym(ym)
 
-        # ── Step 2: Compute feature matrix ──
+        # ── Step 2a: Determine universe (CSI 800 ∩ risk-filtered) ──
+        logger.info("[REBAL] Determining filtered universe...")
+        try:
+            csi800 = fetch_csi800_members()
+            csi800_set = set(csi800["symbol"].tolist())
+            logger.info("  CSI 800: %d constituent stocks", len(csi800_set))
+        except Exception as e:
+            logger.error("[ERROR] Failed to fetch CSI 800 members: %s", e)
+            logger.warning("  Falling back to full A-share universe — results may be unreliable")
+            csi800_set = None
+
+        # Apply risk pre-filters (ST/suspension/liquidity/market cap)
+        # Need market cache + fundamentals for the filter logic
+        # Temporarily query data to run filters
+        raw_market = self._state.query_market_cache(lookback_days=60)
+        try:
+            fund_cache_path = self.config.db_dir / f"fundamentals_{current_date.strftime('%Y%m%d')}.parquet"
+            raw_fund = pd.read_parquet(fund_cache_path) if fund_cache_path.exists() else pd.DataFrame()
+        except Exception:
+            raw_fund = pd.DataFrame()
+
+        risk_valid: set | None = None
+        if not raw_market.empty and not raw_fund.empty:
+            risk_valid = apply_risk_filters(raw_market, raw_fund)
+        else:
+            logger.warning("  [RiskFilter] Skipped — missing market or fundamentals data")
+
+        # Combine: CSI 800 ∩ risk-filtered
+        if csi800_set is not None and risk_valid is not None:
+            final_universe = csi800_set & risk_valid
+            logger.info(
+                "  Final universe: CSI 800 (%d) ∩ Risk-passed (%d) = %d stocks",
+                len(csi800_set), len(risk_valid), len(final_universe),
+            )
+        elif csi800_set is not None:
+            final_universe = csi800_set
+            logger.info("  Final universe: CSI 800 only — %d stocks (%d risk-filtered",
+                       len(final_universe), len(risk_valid) if risk_valid else 0)
+        elif risk_valid is not None:
+            final_universe = risk_valid
+            logger.info("  Final universe: Risk-filtered only — %d stocks (no CSI 800 restriction)",
+                       len(final_universe))
+        else:
+            final_universe = None
+
+        if final_universe is not None and len(final_universe) < 60:
+            logger.warning(
+                "  ⚠ Final universe has only %d stocks — may be insufficient for Top 30 selection",
+                len(final_universe),
+            )
+
+        # ── Step 2b: Compute feature matrix ──
         logger.info("[REBAL] Computing 16-factor feature matrix...")
-        features_df = self._compute_features(current_date)
+        features_df = self._compute_features(current_date, universe_symbols=final_universe)
         if features_df is None or len(features_df) == 0:
             logger.error("[ERROR] Feature computation returned empty — aborting rebalance.")
             return
@@ -349,13 +402,22 @@ class PaperTradingPipeline:
     # Internal Helpers
     # ═══════════════════════════════════════════════════════
 
-    def _compute_features(self, current_date: date) -> Optional[pd.DataFrame]:
+    def _compute_features(
+        self, current_date: date, universe_symbols: set | None = None,
+    ) -> Optional[pd.DataFrame]:
         """
         Query 60-day market cache + fundamentals, compute feature matrix.
 
         Incorporates:
+          - Universe restriction (CSI 800) — enforced BEFORE ranking
+          - Risk pre-filters (ST/suspension/liquidity/market cap)
           - PIT-aligned financial statements (no look-ahead bias)
           - SW industry classification (cached, refreshed monthly)
+
+        Args:
+            current_date: Rebalance date.
+            universe_symbols: If provided, restrict to these symbols only.
+                Must be 6-digit string codes.
 
         Returns:
             pd.DataFrame ready for predict_cross_section(), or None on failure.
@@ -448,12 +510,13 @@ class PaperTradingPipeline:
                 "[WARN] Industry classification failed: %s — "
                 "using global mean neutralization", e)
 
-        # ── Compute factors ──
+        # ── Compute factors (WITHIN restricted universe) ──
         features = compute_feature_matrix(
             market_df,
             fund_df,
             pit_financials=pit_financials,
             industry_map=industry_map,
+            universe_symbols=universe_symbols,
         )
         return features
 

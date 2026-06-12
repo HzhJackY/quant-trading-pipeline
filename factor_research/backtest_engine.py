@@ -613,6 +613,27 @@ def run_backtest_with_costs(
         date_data = df[date_mask].set_index(symbol_col)
 
         # ── 选取当期持仓 (分域等权) ──
+        # Pre-filter: remove uninvestable stocks (suspension, low liquidity, micro-cap)
+        # These filters mirror the paper trading risk pre-filters
+        investable_mask = pd.Series(True, index=date_data.index)
+
+        # 1. Suspension / no-return filter: stock must have valid forward return
+        if return_col in date_data.columns:
+            investable_mask &= date_data[return_col].notna()
+
+        # 2. Liquidity filter: 20-day avg turnover >= 5000万
+        # In backtest, we use the single-period amount as a proxy
+        if amount_c in date_data.columns:
+            investable_mask &= date_data[amount_c].fillna(0) >= 50_000_000
+
+        # 3. Market cap filter: skip micro-caps (< 50亿) if column available
+        mcap_candidates = [c for c in date_data.columns if "mcap" in c.lower() or "总市值" in str(c) or "MCap" in str(c)]
+        if mcap_candidates:
+            mcap_col = mcap_candidates[0]
+            investable_mask &= date_data[mcap_col].fillna(0) >= 5_000_000_000
+
+        date_data = date_data[investable_mask]
+
         holdings = []
         for uni in ["大盘", "小盘"]:
             uni_data = date_data[date_data[universe_col] == uni]

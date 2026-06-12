@@ -637,6 +637,78 @@ def fetch_all_a_share_codes(
     return df
 
 
+def fetch_csi800_members(
+    force_refresh: bool = False,
+    cache_path: str | Path | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch CSI 800 (中证800) constituent list — the EXACT universe used in training.
+
+    CSI 800 = CSI 300 + CSI 500, covering large-cap + mid-cap A-shares.
+
+    Cache-first design: on first success the result is persisted to
+    ``output/csi800_members.parquet``. Subsequent calls read the cache.
+
+    Args:
+        force_refresh: If True, skip the cache and fetch live from akshare.
+        cache_path: Override the default cache location.
+
+    Returns:
+        pd.DataFrame with columns: [symbol] (6-digit codes).
+    """
+    import akshare as ak
+
+    cache = Path(cache_path) if cache_path else Path("output") / "csi800_members.parquet"
+
+    if not force_refresh and cache.exists():
+        try:
+            cached = pd.read_parquet(cache)
+            if len(cached) >= 500:  # CSI 800 should have ~800 stocks
+                logger.info("CSI800 members loaded from cache: %d stocks", len(cached))
+                return cached.reset_index(drop=True)
+            logger.warning("Cached CSI800 too small (%d) — re-fetching", len(cached))
+        except Exception:
+            pass
+
+    try:
+        df = ak.index_stock_cons("000906")
+    except Exception as e:
+        if cache.exists():
+            logger.warning("akshare index_stock_cons failed (%s) — falling back to cache", e)
+            return pd.read_parquet(cache).reset_index(drop=True)
+        raise RuntimeError(f"Failed to fetch CSI 800 constituents: {e}")
+
+    if df.empty:
+        if cache.exists():
+            return pd.read_parquet(cache).reset_index(drop=True)
+        raise RuntimeError("CSI 800 constituent list is empty")
+
+    # Extract 6-digit codes (akshare may return codes with exchange prefix)
+    code_col = None
+    for col in df.columns:
+        col_low = str(col).lower()
+        if any(kw in col_low for kw in ["代码", "code", "symbol", "品种"]):
+            code_col = col
+            break
+    if code_col is None:
+        code_col = df.columns[0]
+
+    codes = (
+        df[code_col]
+        .astype(str)
+        .str.replace(r"[^0-9]", "", regex=True)
+        .str[-6:]
+    )
+    codes = [c for c in codes if c.isdigit() and len(c) == 6]
+    codes = list(dict.fromkeys(codes))  # dedup preserving order
+
+    result = pd.DataFrame({"symbol": codes})
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    result.to_parquet(cache, index=False)
+    logger.info("CSI800 members cached → %s (%d stocks)", cache, len(result))
+    return result
+
+
 # ═══════════════════════════════════════════════════════════
 # Public API: Daily OHLCV — baostock primary, Eastmoney fallback
 # ═══════════════════════════════════════════════════════════
