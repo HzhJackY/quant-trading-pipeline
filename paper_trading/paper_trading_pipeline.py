@@ -266,13 +266,20 @@ class PaperTradingPipeline:
 
         # Apply risk pre-filters (ST/suspension/liquidity/market cap)
         # Need market cache + fundamentals for the filter logic
-        # Temporarily query data to run filters
         raw_market = self._state.query_market_cache(lookback_days=60)
-        try:
-            fund_cache_path = self.config.db_dir / f"fundamentals_{current_date.strftime('%Y%m%d')}.parquet"
-            raw_fund = pd.read_parquet(fund_cache_path) if fund_cache_path.exists() else pd.DataFrame()
-        except Exception:
-            raw_fund = pd.DataFrame()
+        # Use the LATEST available fundamentals file (not date-specific)
+        # — the filter only needs current snapshot data (ST flag, mcap, etc.)
+        raw_fund = pd.DataFrame()
+        fund_files = sorted(
+            self.config.db_dir.glob("fundamentals_*.parquet"), reverse=True
+        )
+        if fund_files:
+            try:
+                raw_fund = pd.read_parquet(fund_files[0])
+                logger.info("  Using fundamentals: %s (%d stocks)",
+                           fund_files[0].name, len(raw_fund))
+            except Exception as e:
+                logger.warning("  Failed to load fundamentals for risk filters: %s", e)
 
         risk_valid: set | None = None
         if not raw_market.empty and not raw_fund.empty:
