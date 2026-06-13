@@ -1836,8 +1836,7 @@ def fetch_and_align_financials(
         # Log progress + checkpoint every 500 stocks
         if (i + 1) % 500 == 0:
             logger.info("  ... %d/%d stocks processed, %d failed",
-                        i + 1 + len(completed) - len(remaining),
-                        len(symbols), n_failed)
+                        len(completed), len(symbols), n_failed)
             _save_progress("pit_financials", completed)
 
         if throttle_seconds > 0 and i < n_total - 1:
