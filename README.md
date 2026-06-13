@@ -53,8 +53,8 @@ quant/
 │
 ├── paper_trading/                  # 纸交易生产管线
 │   ├── paper_trading_pipeline.py   # ★ 每日 cron 入口 + 月末调仓编排
-│   ├── data_ingestion.py           # 日线行情 + 基本面并行数据获取
-│   ├── factor_compute.py           # 16 因子实时计算
+│   ├── data_ingestion.py           # 日线行情 + 基本面并行数据获取 + CSI 800 成分股
+│   ├── factor_compute.py           # 16 因子实时计算 + Universe 限制 + 风控前置过滤
 │   ├── state_manager.py            # 信号锚点持久化 + 市场缓存 SQLite
 │   └── baostock_adapter.py         # Baostock PIT 财务数据适配 (零前看偏差)
 │
@@ -117,7 +117,8 @@ python -c "from factor_research.market_timing import fetch_csi500, plot_timing_h
 python run_timing_comparison.py
 
 # 7. 纸交易 (每日 cron, 16:00 收盘后运行)
-python paper_trading/paper_trading_pipeline.py
+#    首次运行建议加 --force-rebalance 测试调仓:
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance -v
 
 # 8. 每日风控看板 (Streamlit, 盘后 18:00 后)
 streamlit run monitoring/daily_report.py
@@ -248,6 +249,69 @@ streamlit run monitoring/daily_report.py
 - **自动容错**: 数据缺失时优雅降级（显示 N/A 而非崩溃）
 - **缓存策略**: `st.cache_data` 5–10 分钟 TTL, 避免重复拉取行情
 
+## 生产推理管线
+
+纸交易月末调仓的完整执行链路——从原始数据到 Top 30 持仓:
+
+```
+拉取原始数据 (market cache 60d + fundamentals + PIT financials)
+    │
+    ▼
+Phase 2: 物理风控过滤 (apply_risk_filters)
+    ├─ 剔除 ST/*ST               → name 包含 "ST"
+    ├─ 剔除停牌                  → 近 5 日无收盘数据
+    ├─ 剔除低流动性              → 日均成交额 < 5000 万
+    └─ 剔除微盘股                → 总市值 < 50 亿
+    │
+    ▼
+Phase 1: Universe 对齐 (CSI 800 截取)
+    CSI 800 成分股 ∩ 风控通过 = 最终 Universe (~688 只)
+    │
+    ▼
+cross_sectional_rank (仅限最终 Universe 内部百分位)
+    │
+    ▼
+LightGBM 3-seed × 54-fold ensemble 推理
+    │
+    ▼
+Top 30 输出 → signal_anchor → 等权持仓
+```
+
+### 常用指令
+
+```bash
+# 日常纸交易 (自动判断月末调仓)
+python paper_trading/paper_trading_pipeline.py
+
+# 强制调仓 (测试用, 任何日期)
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance
+
+# 强制刷新 PIT 财务数据 (忽略缓存)
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance --force-refresh
+
+# 使用 Baostock PIT 财务 (pubDate 门控, 零前看偏差)
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance --use-baostock
+
+# 跳过数据摄入 (仅使用已有缓存执行调仓)
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance --skip-ingestion
+
+# 调试模式 (详细日志)
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance -v
+```
+
+### 后续优化方向
+
+| 优先级 | 方向 | 说明 |
+|:----:|------|------|
+| 🔴 **P0** | 重新训练生产模型 | 当前模型在 CSI 800 训练但特征重要性退化（EP 单因子占 60%）。需用过滤后的 Universe 重新训练，验证 IC_IR 是否恢复 |
+| 🔴 **P0** | 回测对齐验证 | 跑 `run_timing_comparison.py` 对比修复前后的 Sharpe/MaxDD 变化 |
+| 🟡 **P1** | 信号质量监控 | 在 monitoring dashboard 中加入: 逐日 Top 30 vs Bottom 30 收益差（多空 Spread），信号自相关（换手预警） |
+| 🟡 **P1** | 分级乘数择时 | 当前 0.3/1.0 二元开关过于粗糙。改三级: 0.3 (熊市) / 0.6 (震荡) / 1.0 (牛市)，或连续乘数 = f(vol_percentile) |
+| 🟡 **P1** | 因子实时 IC 监控 | 每期末计算各因子与下期收益的 Rank IC，检测因子失效（如 Momentum 因子）并自动降权 |
+| 🟢 **P2** | 行业中性化改进 | 当前用 board 做代理，可升级为 SW 一级行业分类（已缓存，仅需在 pipeline 中接入） |
+| 🟢 **P2** | 成本模型实盘校准 | 用纸交易实际滑点反校准 Almgren-Chriss γ/η 参数 |
+| 🟢 **P2** | 线性信号并行 | 同时输出 IC_IR 加权线性信号作为对照，在 dashboard 中对比 ML vs Linear Alpha |
+
 ## ML 实验链 (V0 → V7)
 
 | 版本 | 核心设计 | Label | Gap | Sharpe | MaxDD | TO | 结论 |
@@ -319,6 +383,8 @@ streamlit run monitoring/daily_report.py
 | ML 3M gap → 结构性回撤 | 移除 gap, 改用 1M label | V7 验证 gap 是 MaxDD 根因 |
 | 因子多重共线性 | Gram-Schmidt 正交化 (回归残差) | 16 因子全保留, 正交后相关性 < 1e-4 |
 | 大盘择时 (Beta 风控) | MA20/60 死叉 + 波动率 80% 分位 | 与 Alpha 选股严格解耦, 仅缩放敞口 |
+| **ML 推理 Universe 漂移** | CSI 800 强制对齐 (训练=推理) | 全市场 rank → CSI 800 rank, 消除协变量偏移 |
+| **推理前风控缺失** | ST/停牌/流动性/市值四道过滤 | 排雷微盘僵尸股, 降低个股爆雷概率 |
 
 ## 数据来源
 
