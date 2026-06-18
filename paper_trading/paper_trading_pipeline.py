@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -701,14 +702,35 @@ Examples:
 
     pipeline = PaperTradingPipeline(config)
 
-    try:
-        pipeline.run(target_date)
-    except KeyboardInterrupt:
-        logger.info("⏹  Pipeline interrupted by user.")
-        sys.exit(0)
-    except Exception as e:
-        logger.error("[ERROR] Pipeline failed: %s", e, exc_info=args.verbose)
-        sys.exit(1)
+    # Auto-retry on transient network errors (Windows socket issues, etc.)
+    max_retries = 2
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            pipeline.run(target_date)
+            break
+        except KeyboardInterrupt:
+            logger.info("⏹  Pipeline interrupted by user.")
+            sys.exit(0)
+        except (OSError, ConnectionError, TimeoutError) as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = (attempt + 1) * 30
+                logger.warning(
+                    "[RETRY] Network error (attempt %d/%d): %s — "
+                    "waiting %ds before retry...",
+                    attempt + 1, max_retries, e, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    "[ERROR] Pipeline failed after %d retries: %s",
+                    max_retries, e, exc_info=args.verbose,
+                )
+                sys.exit(1)
+        except Exception as e:
+            logger.error("[ERROR] Pipeline failed: %s", e, exc_info=args.verbose)
+            sys.exit(1)
 
 
 # ═══════════════════════════════════════════════════════════
