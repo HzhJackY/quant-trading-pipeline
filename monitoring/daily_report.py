@@ -195,7 +195,7 @@ def load_fundamentals(db_dir: Path = DEFAULT_DB_DIR) -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_trade_dates(lookback_days: int = 10) -> Tuple[Optional[str], Optional[str]]:
-    """获取最近两个交易日 (T, T-1)."""
+    """获取最近两个交易日 (T, T-1). Falls back to local cache if baostock fails."""
     end_date = date.today()
     start_date = end_date - timedelta(days=lookback_days)
     try:
@@ -204,7 +204,7 @@ def get_trade_dates(lookback_days: int = 10) -> Tuple[Optional[str], Optional[st
             end_date=end_date.strftime("%Y-%m-%d"),
         )
         if rs.error_code != "0":
-            return None, None
+            raise RuntimeError(f"baostock error [{rs.error_code}]")
         trade_dates = []
         while rs.next():
             row = rs.get_row_data()
@@ -217,7 +217,40 @@ def get_trade_dates(lookback_days: int = 10) -> Tuple[Optional[str], Optional[st
             return trade_dates[0], None
         return None, None
     except Exception:
+        return _get_trade_dates_from_cache(lookback_days)
+
+
+def _get_trade_dates_from_cache(lookback_days: int = 10) -> Tuple[Optional[str], Optional[str]]:
+    """Fallback: read latest trade dates from local SQLite market_cache."""
+    try:
+        import sqlite3
+        db_path = _find_db_path()
+        if not db_path or not db_path.exists():
+            return None, None
+        conn = sqlite3.connect(str(db_path))
+        dates = pd.read_sql_query(
+            "SELECT DISTINCT trade_date FROM market_cache ORDER BY trade_date DESC LIMIT ?",
+            conn, params=(lookback_days,),
+        )
+        conn.close()
+        if len(dates) >= 2:
+            return str(dates.iloc[0, 0]), str(dates.iloc[1, 0])
+        elif len(dates) == 1:
+            return str(dates.iloc[0, 0]), None
         return None, None
+    except Exception:
+        return None, None
+
+
+def _find_db_path() -> Optional[Path]:
+    """Find state.db in default or configured locations."""
+    for candidate in [
+        DEFAULT_DB_PATH,
+        _project_root / "output" / "paper_trading_db" / "state.db",
+    ]:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def fetch_point_close(symbols: list[str], target_date: str) -> pd.DataFrame:
@@ -254,6 +287,25 @@ def fetch_point_close(symbols: list[str], target_date: str) -> pd.DataFrame:
         except Exception:
             results.append({"symbol": sym, "close": np.nan})
     return pd.DataFrame(results)
+
+
+def _fetch_close_from_cache(symbols: list[str], target_date: str) -> pd.DataFrame:
+    """Fallback: read close prices from local SQLite market_cache."""
+    try:
+        import sqlite3
+        db_path = _find_db_path()
+        if not db_path or not db_path.exists():
+            return pd.DataFrame(columns=["symbol", "close"])
+        conn = sqlite3.connect(str(db_path))
+        placeholders = ",".join("?" for _ in symbols)
+        df = pd.read_sql_query(
+            f"SELECT symbol, close FROM market_cache WHERE trade_date = ? AND symbol IN ({placeholders})",
+            conn, params=[target_date] + list(symbols),
+        )
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "close"])
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -965,17 +1017,21 @@ def main():
 
     st.title("📊 Top 30 量化组合 · 每日风控看板")
 
-    # ── Baostock 登录 ──
+    # ── Baostock 登录 (soft dependency) ──
     login_ph = st.empty()
+    use_baostock = False
     try:
         lg = bs.login()
-        if lg.error_code != "0":
-            login_ph.error(f"❌ Baostock 登录失败 [{lg.error_code}] {lg.error_msg}")
-            st.stop()
-    except Exception as e:
-        login_ph.error(f"❌ Baostock 连接异常: {e}")
-        st.stop()
-    login_ph.success("⚡ Baostock 已连接")
+        if lg.error_code == "0":
+            use_baostock = True
+            login_ph.success("⚡ Baostock 已连接")
+        else:
+            login_ph.warning(
+                f"⚠️ Baostock 不可用 [{lg.error_code}] — "
+                f"使用本地缓存数据（行情/基准可能延迟）"
+            )
+    except Exception:
+        login_ph.warning("⚠️ Baostock 连接失败 — 使用本地缓存数据")
 
     try:
         # ────────────────────────────────────────────────
@@ -983,7 +1039,8 @@ def main():
         # ────────────────────────────────────────────────
         t_date, t1_date = get_trade_dates()
         if t_date is None:
-            st.warning("⚠️ 无法获取交易日列表"); st.stop()
+            st.warning("⚠️ 无法获取交易日（Baostock 不可用且本地缓存为空）")
+            st.stop()
 
         today_str = date.today().strftime("%Y-%m-%d")
         if t_date < today_str:
@@ -999,23 +1056,45 @@ def main():
             st.warning(f"⚠️ 无持仓数据 (`{db_path}`)"); st.stop()
 
         # ────────────────────────────────────────────────
-        # Step 3: 行情数据
+        # Step 3: 行情数据 (baostock primary, local cache fallback)
         # ────────────────────────────────────────────────
         progress_ph = st.empty()
-        all_symbols = positions["symbol"].tolist() + [BENCHMARK_SYMBOL]
+        all_symbols = positions["symbol"].tolist() + (
+            [BENCHMARK_SYMBOL] if use_baostock else []
+        )
 
-        progress_ph.text(f"⏳ 正在拉取 T={t_date} 收盘价（{len(all_symbols)} 只标的）...")
-        t_prices = fetch_point_close(all_symbols, t_date)
-        t_prices = t_prices.rename(columns={"close": "close_t"})
+        if use_baostock:
+            progress_ph.text(f"⏳ 正在通过 Baostock 拉取 T={t_date} 收盘价（{len(all_symbols)} 只标的）...")
+            t_prices = fetch_point_close(all_symbols, t_date)
+            t_prices = t_prices.rename(columns={"close": "close_t"})
 
-        if t1_date:
-            progress_ph.text(f"⏳ 正在拉取 T-1={t1_date} 收盘价...")
-            t1_prices = fetch_point_close(all_symbols, t1_date)
-            t1_prices = t1_prices.rename(columns={"close": "close_t_minus_1"})
-            prices_df = t_prices.merge(t1_prices, on="symbol", how="left")
+            if t1_date:
+                progress_ph.text(f"⏳ 正在拉取 T-1={t1_date} 收盘价...")
+                t1_prices = fetch_point_close(all_symbols, t1_date)
+                t1_prices = t1_prices.rename(columns={"close": "close_t_minus_1"})
+                prices_df = t_prices.merge(t1_prices, on="symbol", how="left")
+            else:
+                prices_df = t_prices.copy()
+                prices_df["close_t_minus_1"] = np.nan
         else:
-            prices_df = t_prices.copy()
-            prices_df["close_t_minus_1"] = np.nan
+            # ── Local cache fallback ──
+            progress_ph.text(f"⏳ 正在从本地缓存读取 T={t_date} 收盘价...")
+            t_prices = _fetch_close_from_cache(all_symbols, t_date)
+            if "close" in t_prices.columns:
+                t_prices = t_prices.rename(columns={"close": "close_t"})
+            else:
+                t_prices["close_t"] = np.nan
+
+            if t1_date:
+                t1_prices = _fetch_close_from_cache(all_symbols, t1_date)
+                if "close" in t1_prices.columns:
+                    t1_prices = t1_prices.rename(columns={"close": "close_t_minus_1"})
+                else:
+                    t1_prices["close_t_minus_1"] = np.nan
+                prices_df = t_prices.merge(t1_prices, on="symbol", how="left")
+            else:
+                prices_df = t_prices.copy()
+                prices_df["close_t_minus_1"] = np.nan
         progress_ph.empty()
 
         if prices_df["close_t"].notna().sum() == 0:
@@ -1087,13 +1166,17 @@ def main():
         # 页脚
         st.divider()
         st.caption(
-            f"数据来源: Baostock + SQLite Market Cache · "
+            f"数据来源: {'Baostock' if use_baostock else '本地缓存 (Baostock 不可用)'} + SQLite Market Cache · "
             f"更新时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
             f"`{db_path}`"
         )
 
     finally:
-        bs.logout()
+        if use_baostock:
+            try:
+                bs.logout()
+            except Exception:
+                pass
         login_ph.empty()
 
 
