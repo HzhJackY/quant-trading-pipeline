@@ -2,35 +2,35 @@
 
 | Metric | V0: Linear | V5: 3M+gap+TO L2 | V7: 1M+0gap+TO L2 |
 |--------|:---:|:---:|:---:|
-| Annualized Return | 21.27% | 20.01% | 20.57% |
-| Volatility | 16.98% | 18.90% | 19.01% |
-| **Sharpe Ratio** | 1.1347 | 0.9527 | 0.9767 |
-| **Max Drawdown** | -18.01% | -27.12% | -27.12% |
-| Calmar Ratio | 1.1805 | 0.7377 | 0.7585 |
-| Win Rate | 61.46% | 62.50% | 64.58% |
+| Annualized Return | 21.06% | 20.42% | 20.81% |
+| Volatility | 17.42% | 19.20% | 19.22% |
+| **Sharpe Ratio** | 1.0941 | 0.9594 | 0.9783 |
+| **Max Drawdown** | -22.55% | -30.00% | -30.00% |
+| Calmar Ratio | 0.9342 | 0.6806 | 0.6935 |
+| Win Rate | 62.11% | 63.16% | 64.21% |
 
 ### Trading Characteristics
 
 | Metric | V0: Linear | V5: 3M+gap+TO L2 | V7: 1M+0gap+TO L2 |
 |--------|:---:|:---:|:---:|
-| Monthly Turnover | 23.7% | 12.9% | 12.6% |
-| Monthly Cost (bps) | 5.9 | 3.4 | 3.3 |
+| Monthly Turnover | 27.7% | 18.8% | 18.1% |
+| Monthly Cost (bps) | 6.9 | 5.1 | 5.0 |
 
 ### V7 vs V5 — Key Improvements
 
 | Metric | V5 | V7 | Delta |
 |--------|:---:|:---:|:---:|
-| Sharpe | 0.9527 | 0.9767 | +0.0240 |
-| MaxDD | -27.12% | -27.12% | 0.00% |
-| Turnover | 12.95% | 12.61% | -0.34% |
-| Cost | 3.4218 | 3.3400 | -0.0818 |
+| Sharpe | 0.9594 | 0.9783 | +0.0189 |
+| MaxDD | -30.00% | -30.00% | 0.00% |
+| Turnover | 18.80% | 18.06% | -0.74% |
+| Cost | 5.1435 | 4.9561 | -0.1874 |
 
 ### Production Readiness Assessment
 
 | Criterion | Met? | Value |
 |-----------|------|-------|
-| Sharpe > 1.0 | NO | 0.9767 |
-| MaxDD < -20% | NO | -27.12% |
-| Turnover < 25% | YES | 12.6% |
+| Sharpe > 1.0 | NO | 0.9783 |
+| MaxDD < -20% | NO | -30.00% |
+| Turnover < 25% | YES | 18.1% |
 
 **1/3 criteria met.**

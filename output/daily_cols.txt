@@ -1,0 +1,20 @@
+Daily CSV columns:
+  日期
+  开盘
+  收盘
+  最高
+  最低
+  成交量
+  成交额
+  换手率
+
+Financial CSV columns:
+  symbol
+  report_date
+  净利润
+  营业收入
+  ROE
+  Debt_Ratio
+  每股净资产
+  每股收益
+  销售净利率

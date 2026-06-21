@@ -107,7 +107,7 @@ if not logger.handlers:
 # Configuration
 # ═══════════════════════════════════════════════════════════
 
-DEFAULT_MODEL_DIR = Path("output/production_models")
+DEFAULT_MODEL_DIR = Path("output/production_models_v2_full")
 DEFAULT_DB_DIR = Path("output/paper_trading_db")
 TOP_N_DISPLAY = 30
 
@@ -571,7 +571,7 @@ class PaperTradingPipeline:
         print(f"   TOP {n} BUY TARGETS — {ym}")
         if timing_multiplier < 1.0:
             print(f"   {'='*68}")
-            print(f"   ⚠  MARKET TIMING TRIGGERED — 仓位乘数={timing_multiplier:.1f}")
+            print(f"   [!] MARKET TIMING TRIGGERED -- position multiplier={timing_multiplier:.1f}")
             print(f"   Total equity exposure: {timing_multiplier:.0%} | "
                   f"Cash reserve: {1-timing_multiplier:.0%}")
             print(f"   {'='*68}")
