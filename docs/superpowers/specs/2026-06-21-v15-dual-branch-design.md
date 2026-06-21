@@ -111,10 +111,15 @@ Rules:
 
 - A new stock with no prior smoothed value uses its current raw blend.
 - A stock absent from a month receives no synthetic prediction.
-- If it re-enters later, its last observed smoothed signal is retained.
-- Non-finite current signals fall back to the last valid smoothed signal; if
-  neither exists, the row remains missing and is excluded from portfolio
-  selection.
+- EMA memory is valid only when the stock also appeared on the immediately
+  preceding global OOS rebalance date.
+- If a stock is absent for one or more rebalance dates and later re-enters,
+  its stored EMA state is discarded and the current raw blend initializes a
+  fresh signal. This prevents stale pre-suspension signals from influencing
+  resumed stocks.
+- Non-finite current signals fall back to the last valid smoothed signal only
+  if the stock appeared on the immediately preceding rebalance date. Otherwise
+  the row remains missing and is excluded from portfolio selection.
 
 The final prediction file contains:
 
@@ -182,6 +187,7 @@ Unit tests cover:
 - cross-sectional percentile ranking;
 - weighted rank blend;
 - EMA initialization, continuation, disappearance, and re-entry;
+- EMA stale-state reset after a missed global rebalance date;
 - fixed Top-30 turnover calculation;
 - positive exposure calculation on a controlled fixture;
 - invalid weights and mismatched branch predictions.
