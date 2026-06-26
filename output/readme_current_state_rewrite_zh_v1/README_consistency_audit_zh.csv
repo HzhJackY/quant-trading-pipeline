@@ -1,0 +1,11 @@
+﻿issue,old_text_or_section,problem,new_treatment,pass
+Split-Universe 主线降级,开头定位 / 项目结构 / Split-Universe 双模型系统,旧 README 将 Split-Universe 描述为当前核心系统,移入历史研究归档，不再作为当前生产核心,True
+V7 主线降级,核心结论 / Runner 脚本指南 / 快速开始,旧 README 将 ML V7 表述为终版生产模型,移入历史研究归档，不再作为当前生产模型,True
+生产候选显式化,README 开头状态说明与主体不一致,旧主体没有把 Compact-F + Top50 Buffer 写成核心结论,在当前状态、核心结论、生产候选章节中显式写入,True
+Top50 Buffer 指标纳入,核心结论,旧 README 缺少 Top50 Buffer 35/75 指标,新增 Top30 baseline vs Top50 Buffer 35/75 表格,True
+Compact-FT / FT3 拒绝入选,旧 README 无该结论,未明确技术因子扩展不作为生产推荐,新增 Compact-F vs Compact-FT / FT3 对比与拒绝结论,True
+Market timing 降级,大盘择时章节,旧 README 容易让人误解为生产默认仓位控制,标题改为仅监控，不作为默认生产仓位,True
+Media15 / XHS / 百度指数独立化,旧 README 无独立研究线边界,容易被误读为可直接接入主线 alpha,新增另类数据研究章节，明确不接入 Compact-F,True
+V1.5 不再是 P0,后续优化方向 / Roadmap,旧 README 仍将 V1.5、GS softening、technical tuning 列为 P0/P1,Roadmap 改写为生产治理、执行校准、风格监控、研究分支,True
+paper_trading Top30 与 production Top50 不一致标注,纸交易章节,实现口径仍可能是 Top30，若不标注会造成治理歧义,明确写出当前不一致，并要求后续 production governance 对齐,True
+历史研究归档保留,Split-Universe / V0-V7 / Alpha Drift / Phase B,不能删除历史研究痕迹，但必须降级,集中放入历史研究归档章节，保留追溯用途说明,True
