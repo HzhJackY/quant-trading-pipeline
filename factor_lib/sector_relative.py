@@ -357,35 +357,52 @@ def load_shenwan_industry(
         bs.login()
         industry_rows = []
 
+        # Helper: convert 6-digit code to baostock format
+        def _to_bs_code(code: str) -> str:
+            code = str(code).zfill(6)
+            if code.startswith(('6', '9')):
+                return f"sh.{code}"
+            else:
+                return f"sz.{code}"
+
+        # Helper: extract 6-digit symbol from baostock code
+        def _from_bs_code(bs_code: str) -> str:
+            return bs_code.replace("sh.", "").replace("sz.", "").zfill(6)
+
         # Baostock industry classification codes
         target_symbols = symbols or []
         if not target_symbols:
-            # If no symbols specified, try to get all stocks
-            rs = bs.query_stock_basic()
+            # If no symbols specified, try to get all A-share stocks
+            rs = bs.query_stock_basic(code_name="A股")
             if rs.error_code == "0":
                 while rs.next():
                     row = rs.get_row_data()
-                    target_symbols.append(row[0])
+                    # row[0] = baostock code (sh.600000), row[1] = name
+                    target_symbols.append(_from_bs_code(row[0]))
 
+        logger.info("Fetching industry for %d symbols...", len(target_symbols))
+        n_fetched = 0
         for sym in target_symbols:
             try:
-                # Baostock query for industry classification
-                rs = bs.query_stock_industry(sym)
+                bs_code = _to_bs_code(sym)
+                rs = bs.query_stock_industry(bs_code)
                 if rs.error_code == "0":
                     while rs.next():
                         row = rs.get_row_data()
-                        # Row: [code, code_name, industry, industry_code, ...]
-                        ind_name = row[2] if len(row) > 2 else "未知"
+                        # Row: [update_date, code, code_name, industry, industry_code]
+                        ind_name = row[3] if len(row) > 3 else (row[2] if len(row) > 2 else "未知")
                         # Map to Shenwan L1 categories
                         industry_rows.append({
                             "symbol": sym,
                             "sw_l1": _map_to_sw_l1(ind_name),
                         })
+                        n_fetched += 1
                         break  # Take first classification
             except Exception:
                 continue
 
         bs.logout()
+        logger.info("Fetched industry for %d/%d symbols", n_fetched, len(target_symbols))
 
         if industry_rows:
             result = pd.DataFrame(industry_rows)

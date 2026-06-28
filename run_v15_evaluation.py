@@ -42,14 +42,25 @@ CSV_PATH = OUTPUT_DIR / "v15_experiment_evaluation.csv"
 
 MODEL_NAMES = ["M0", "M1", "M2", "M3", "M4", "M5"]
 
+# Map model IDs to actual config names (filenames use config names)
+MODEL_ID_TO_CONFIG = {
+    "M0": "M0_V2_Baseline",
+    "M1": "M1_V15_Core",
+    "M2": "M2_V15_Mono",
+    "M3": "M3_V15_GS_Soft",
+    "M4": "M4_V15_AltGrowth",
+    "M5": "M5_V15_Full",
+}
+
 
 # ═══════════════════════════════════════════════════════════
 # Load OOS predictions
 # ═══════════════════════════════════════════════════════════
 
-def load_predictions(model_name: str) -> pd.DataFrame:
-    """Load OOS predictions for one model."""
-    path = MODEL_OUTPUT_DIR / f"{model_name}_oos.parquet"
+def load_predictions(model_id: str) -> pd.DataFrame:
+    """Load OOS predictions for one model ID."""
+    config_name = MODEL_ID_TO_CONFIG.get(model_id, model_id)
+    path = MODEL_OUTPUT_DIR / f"{config_name}_oos.parquet"
     if not path.exists():
         raise FileNotFoundError(f"Predictions not found: {path}")
     preds = pd.read_parquet(path)
@@ -58,13 +69,41 @@ def load_predictions(model_name: str) -> pd.DataFrame:
 
 
 def load_all_predictions(models: list[str]) -> dict[str, pd.DataFrame]:
-    """Load predictions for all specified models."""
+    """Load predictions for all specified models, with forward returns merged."""
+    # Load forward returns from V1.5 panel
+    v15_panel = OUTPUT_DIR / "training_panel_v15_sr.parquet"
+    if v15_panel.exists():
+        panel = pd.read_parquet(v15_panel, columns=["date", "symbol"])
+        panel["date"] = pd.to_datetime(panel["date"])
+        # Also load close for return computation
+        panel_full = pd.read_parquet(v15_panel)
+        close_col = None
+        for c in panel_full.columns:
+            if c == "收盘" or c == "close":
+                close_col = c
+                break
+        if close_col:
+            panel_full = panel_full[["date", "symbol", close_col]].copy()
+            panel_full["date"] = pd.to_datetime(panel_full["date"])
+            panel_full = panel_full.sort_values(["symbol", "date"])
+            panel_full["forward_return_1m"] = panel_full.groupby("symbol")[close_col].transform(
+                lambda x: x.shift(-1) / x - 1.0
+            )
+            fwd_rets = panel_full[["date", "symbol", "forward_return_1m"]].dropna()
+        else:
+            fwd_rets = None
+    else:
+        fwd_rets = None
+
     results = {}
     for mid in models:
         try:
-            results[mid] = load_predictions(mid)
-            logger.info("Loaded %s: %d rows, %d dates",
-                         mid, len(results[mid]), results[mid]["date"].nunique())
+            preds = load_predictions(mid)
+            # Merge forward returns
+            if fwd_rets is not None:
+                preds = preds.merge(fwd_rets, on=["date", "symbol"], how="left")
+            results[mid] = preds
+            logger.info("Loaded %s: %d rows, %d dates", mid, len(results[mid]), results[mid]["date"].nunique())
         except FileNotFoundError as e:
             logger.warning("Skipping %s: %s", mid, e)
     return results
@@ -212,16 +251,18 @@ def compute_ic(
         if len(cross) < 30:
             continue
 
-        if label_col not in cross.columns:
-            # If we don't have actual forward return, use signal quality
+        # Use forward_return_1m if available, else label
+        ret_col = "forward_return_1m" if "forward_return_1m" in cross.columns else label_col
+
+        if ret_col not in cross.columns:
             continue
 
-        valid = cross[[signal_col, label_col]].dropna()
+        valid = cross[[signal_col, ret_col]].dropna()
         if len(valid) < 30:
             continue
 
         try:
-            ic, _ = spearmanr(valid[signal_col], valid[label_col])
+            ic, _ = spearmanr(valid[signal_col], valid[ret_col])
             if not np.isnan(ic):
                 ics.append(ic)
         except Exception:

@@ -171,7 +171,7 @@ python run\_timing\_comparison.py
 
 # 首次运行建议加 --force-rebalance 测试调仓:
 
-python paper\_trading/paper\_trading\_pipeline.py --date 2026-06-30 --force-rebalance -v
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance -v
 
 \# 8. 每日风控看板 (Streamlit, 盘后 18:00 后)  
 streamlit run monitoring/daily\_report.py

@@ -143,7 +143,7 @@ M1_V15_CORE = ExperimentConfig(
         "Debt_Ratio_neutral_z", "Net_Profit_Margin_neutral_z",
         "VolChg_20D_neutral_z", "PriceDev_20D_neutral_z",
         # Value (original + BP restored)
-        "EP_neutral_z", "BP_neutral_z",
+        "EP_neutral_z", "BP_raw_neutral_z",
         # Sector-relative quality/growth (replaces original)
         "SR_ROE_neutral_z",
         "SR_ProfitGrowth_YoY_neutral_z",
@@ -185,7 +185,7 @@ M3_V15_GS_SOFT = ExperimentConfig(
 # ── M4: V1.5-AltGrowth ──
 M4_V15_ALT_GROWTH = ExperimentConfig(
     name="M4_V15_AltGrowth",
-    description="V1.5 + Alt Growth: GS=OFF, colsample=0.75, EPS_YoY+ROE_Stability replace PG/RevGrowth",
+    description="V1.5 + Alt Growth: GS=OFF, colsample=0.75, EPS_YoY replaces PG, SR factors retained",
     panel_path=V15_PANEL_PATH,
     feature_neutral_z=[
         # Stable
@@ -194,12 +194,11 @@ M4_V15_ALT_GROWTH = ExperimentConfig(
         "Debt_Ratio_neutral_z", "Net_Profit_Margin_neutral_z",
         "VolChg_20D_neutral_z", "PriceDev_20D_neutral_z",
         # Value
-        "EP_neutral_z", "BP_neutral_z",
+        "EP_neutral_z", "BP_raw_neutral_z",
         # Sector-relative ROE
         "SR_ROE_neutral_z",
         # New quality/growth factors (REPLACE PG and RevGrowth)
         "EPS_YoY_neutral_z",
-        "ROE_Stability_neutral_z",
         # Keep SR_RevGrowth for breadth
         "SR_RevGrowth_YoY_neutral_z",
     ],
@@ -211,7 +210,7 @@ M4_V15_ALT_GROWTH = ExperimentConfig(
 # ── M5: V1.5-Full ──
 M5_V15_FULL = ExperimentConfig(
     name="M5_V15_Full",
-    description="V1.5 Full: GS=OFF, colsample=0.75, ALL factors + monotonicity + alt growth",
+    description="V1.5 Full: GS=OFF, colsample=0.35, 33 factors + monotonicity + L1 regularization",
     panel_path=V15_PANEL_PATH,
     feature_neutral_z=[
         # Stable
@@ -220,25 +219,44 @@ M5_V15_FULL = ExperimentConfig(
         "Debt_Ratio_neutral_z", "Net_Profit_Margin_neutral_z",
         "VolChg_20D_neutral_z", "PriceDev_20D_neutral_z",
         # Value
-        "EP_neutral_z", "BP_neutral_z",
+        "EP_neutral_z", "BP_raw_neutral_z",
         # Sector-relative quality/growth
         "SR_ROE_neutral_z",
         "SR_ProfitGrowth_YoY_neutral_z",
         "SR_RevGrowth_YoY_neutral_z",
         # Alternative growth
         "EPS_YoY_neutral_z",
-        "ROE_Stability_neutral_z",
+        # Extended classic factors — financial ratios
+        "Current_Ratio_neutral_z",
+        "Quick_Ratio_neutral_z",
+        "CFO_to_Earnings_neutral_z",
+        "Operating_Margin_neutral_z",
+        "Equity_Multiplier_neutral_z",
+        "Operating_Cycle_Days_neutral_z",
+        "Inventory_Turnover_neutral_z",
+        "Receivables_Turnover_neutral_z",
+        # Extended classic factors — technical
+        "RSI_14_neutral_z",
+        "Skewness_60D_neutral_z",
+        "MaxDD_60D_neutral_z",
+        "Vol_120D_neutral_z",
+        "High_Low_Range_20D_neutral_z",
+        "Amihud_Illiquidity_neutral_z",
+        "Dollar_Volume_20D_neutral_z",
+        "Turnover_Volatility_20D_neutral_z",
         # Alt-data slot (NaN-filled; GS=OFF ensures not silently killed)
         # "SR_xhs_buzz_neutral_z",  # TODO: uncomment when data available
     ],
     gs_enabled=False,
-    colsample_bytree=0.75,
+    colsample_bytree=0.35,     # Selected over 0.50 after controlled 33-factor ablation
+    reg_alpha=1.0,              # L1 penalty on feature over-reliance
     learning_rate=0.05,
     monotone_constraints={
         "SR_ProfitGrowth_YoY_neutral_z": +1,
         "EPS_YoY_neutral_z": +1,
         "SR_ROE_neutral_z": +1,
         "EP_neutral_z": +1,
+        "CFO_to_Earnings_neutral_z": +1,  # Higher cash flow quality → better
     },
 )
 
@@ -413,6 +431,23 @@ def train_single_model(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Compute forward returns (needed for GS IC_IR ranking and labels) ──
+    close_col = None
+    for c in panel.columns:
+        if c == "收盘" or c == "close":
+            close_col = c
+            break
+    if close_col is None:
+        raise KeyError("No close price column found in panel")
+
+    panel = panel.sort_values(["symbol", "date"]).reset_index(drop=True)
+    panel["forward_return_1m"] = panel.groupby("symbol")[close_col].transform(
+        lambda x: x.shift(-1) / x - 1.0
+    )
+    panel["label"] = panel.groupby("date")["forward_return_1m"].rank(
+        pct=True, na_option="bottom"
+    ).fillna(0.5)
+
     # ── Prepare panel: GS if enabled ──
     if cfg.gs_enabled:
         logger.info("[%s] Applying GS (max_corr=%.2f)...", cfg.name, cfg.gs_max_correlation)
@@ -450,28 +485,9 @@ def train_single_model(
     # Temporarily modify the panel to only contain the columns needed
     feature_cols_available = [c for c in cfg.feature_neutral_z if c in panel.columns]
 
-    # ── Prepare labels ──
+    # ── Use pre-computed labels from panel ──
     df = panel.copy()
     df["date"] = pd.to_datetime(df["date"])
-
-    # Find close column
-    close_col = None
-    for c in df.columns:
-        if c == "收盘" or c == "close":
-            close_col = c
-            break
-
-    if close_col is None:
-        raise KeyError("No close price column found")
-
-    # Compute forward returns and labels
-    df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
-    df["forward_return_1m"] = df.groupby("symbol")[close_col].transform(
-        lambda x: x.shift(-1) / x - 1.0
-    )
-    df["label"] = df.groupby("date")["forward_return_1m"].rank(
-        pct=True, na_option="bottom"
-    ).fillna(0.5)
 
     # ── Rank-normalize features ──
     rank_cols = []
