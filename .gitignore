@@ -1,45 +1,67 @@
+# Runtime / generated outputs
+output/
+logs/
+
+# Raw / generated data
+data/raw/
+data/processed/
+data/cache/
+
+# Large artifacts anywhere
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+*.old
+.pipeline_state.json
+
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
+build/
 
-# Testing
+# Testing / notebooks
 .pytest_cache/
-
-# Jupyter
+.mypy_cache/
 .ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+env/
 
 # IDE
 .vscode/
 .idea/
 
-# Data (cache / generated)
-data/raw/
-data/processed/
+# Local secrets / env
+.env
+.env.*
+*.secret
 
-# Pipeline output (large / reproducible)
-output/*.parquet
-output/*.csv
-output/*.png
-.pipeline_state.json
+# Local tools
+.claude/
+.codex/
+.cursor/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Error logs
-data/error_log.txt
-
-# Paper trading runtime (SQLite DB + cached parquet)
-output/paper_trading_db/
-
-# Production models (large binary artifacts)
-output/production_models/
-
 # Local environment scripts
 init_local_state.bat
 
-# Claude internal
-.claude/
-resume/ 
+# Personal / resume drafts
+resume/
