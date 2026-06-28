@@ -65,3 +65,34 @@ init_local_state.bat
 
 # Personal / resume drafts
 resume/
+
+# Generated runtime outputs
+output/
+logs/
+
+# Data / cache
+data/raw/
+data/processed/
+data/cache/
+data/error_log.txt
+
+# External / crawler projects
+MediaCrawler/
+mediacrawler_chrome_profile/
+mediacrawler_edge_profile/
+
+# Alternative data project kept outside main repo
+xhs/data/
+xhs/output/
+xhs/logs/
+xhs/MediaCrawler/
+
+# Local spreadsheets / temp logs
+*.xls
+*.xlsx
+restructure_log.txt
+
+# Local tools
+.codex/
+.cursor/
+.claude/
