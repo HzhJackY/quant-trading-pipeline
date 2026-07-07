@@ -3,9 +3,7 @@ output/
 logs/
 
 # Raw / generated data
-data/raw/
-data/processed/
-data/cache/
+data/
 
 # Large artifacts anywhere
 *.parquet
@@ -48,8 +46,10 @@ env/
 
 # Local secrets / env
 .env
+*.env
+.env.local
 .env.*
-*.secret
+xhs/
 
 # Local tools
 .claude/
@@ -65,16 +65,13 @@ init_local_state.bat
 
 # Personal / resume drafts
 resume/
+token.txt
+signCode.txt
 
 # Generated runtime outputs
 output/
 logs/
 
-# Data / cache
-data/raw/
-data/processed/
-data/cache/
-data/error_log.txt
 
 # External / crawler projects
 MediaCrawler/
@@ -96,3 +93,27 @@ restructure_log.txt
 .codex/
 .cursor/
 .claude/
+
+# Additional generated outputs / caches
+outputs/
+cache/
+.cache/
+.ruff_cache/
+
+
+# Large local CSV exports
+data/**/*.csv
+output/**/*.csv
+outputs/**/*.csv
+logs/**/*.csv
+
+# Secrets
+token.txt
+signCode.txt
+*.key
+*.pem
+*.secret
+.env
+.env.*
+!.env.example
+!.env.template

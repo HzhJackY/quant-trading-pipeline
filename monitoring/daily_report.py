@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -46,6 +46,7 @@ DEFAULT_DB_DIR  = _project_root / "output" / "paper_trading_db"
 BENCHMARK_BS_CODE = "sh.000905"
 BENCHMARK_SYMBOL = "000905"
 TOP_N = 30
+MARKET_DATA_READY_TIME = time(17, 0)
 
 # 风控阈值
 DRAWDOWN_ALERT_THRESHOLD = -0.07   # 单日跌幅超过 -7% 触发预警
@@ -240,6 +241,58 @@ def _get_trade_dates_from_cache(lookback_days: int = 10) -> Tuple[Optional[str],
         return None, None
     except Exception:
         return None, None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_cached_trade_dates(db_path: Path, limit: int = 20) -> list[str]:
+    """Read recent market_cache trade dates without touching large market data."""
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(db_path))
+        dates = pd.read_sql_query(
+            "SELECT DISTINCT trade_date FROM market_cache ORDER BY trade_date DESC LIMIT ?",
+            conn,
+            params=(limit,),
+        )
+        conn.close()
+        return [str(v)[:10] for v in dates["trade_date"].tolist()]
+    except Exception:
+        return []
+
+
+def resolve_display_trade_dates(
+    db_path: Path,
+    t_date: Optional[str],
+    t1_date: Optional[str],
+    now: Optional[datetime] = None,
+) -> tuple[Optional[str], Optional[str], str]:
+    """
+    Choose the date shown by the dashboard.
+
+    Before 17:00 on a trading day, today's close is usually unavailable. In that
+    window the dashboard should show the latest cached session instead of trying
+    to fetch today's incomplete data and stopping with an empty screen.
+    """
+    if t_date is None:
+        return None, None, "no_trade_date"
+
+    now = now or datetime.now()
+    today_str = now.date().strftime("%Y-%m-%d")
+    cached_dates = get_cached_trade_dates(db_path)
+
+    if t_date == today_str and now.time() < MARKET_DATA_READY_TIME:
+        prior_cached = [d for d in cached_dates if d < today_str]
+        if prior_cached:
+            display_t = prior_cached[0]
+            display_t1 = prior_cached[1] if len(prior_cached) > 1 else None
+            return display_t, display_t1, "before_close_use_latest_cached"
+        if t1_date:
+            prior_to_t1 = [d for d in cached_dates if d < t1_date]
+            display_t1 = prior_to_t1[0] if prior_to_t1 else None
+            return t1_date, display_t1, "before_close_fallback_to_previous_trade_date"
+
+    return t_date, t1_date, "use_resolved_trade_date"
 
 
 def _find_db_path() -> Optional[Path]:
@@ -1043,8 +1096,19 @@ def main():
             st.stop()
 
         today_str = date.today().strftime("%Y-%m-%d")
-        if t_date < today_str:
-            st.info(f"📅 最近交易日 **{t_date}**（今日 {today_str} 非交易日）")
+        raw_t_date, raw_t1_date = t_date, t1_date
+        t_date, t1_date, date_source = resolve_display_trade_dates(db_path, raw_t_date, raw_t1_date)
+        if t_date is None:
+            st.warning("⚠️ 无法确定可展示交易日（本地行情缓存为空）")
+            st.stop()
+
+        if date_source.startswith("before_close"):
+            st.info(
+                f"📅 当前早于 {MARKET_DATA_READY_TIME.strftime('%H:%M')}，"
+                f"暂不拉取今日 {today_str} 行情；展示最近已缓存交易日 **{t_date}**"
+            )
+        elif t_date < today_str:
+            st.info(f"📅 最近交易日 **{t_date}**（今日 {today_str} 非交易日或数据未更新）")
         else:
             st.info(f"📅 交易日期 **{t_date}**")
 
@@ -1059,11 +1123,12 @@ def main():
         # Step 3: 行情数据 (baostock primary, local cache fallback)
         # ────────────────────────────────────────────────
         progress_ph = st.empty()
+        use_live_prices = use_baostock and not date_source.startswith("before_close")
         all_symbols = positions["symbol"].tolist() + (
-            [BENCHMARK_SYMBOL] if use_baostock else []
+            [BENCHMARK_SYMBOL] if use_live_prices else []
         )
 
-        if use_baostock:
+        if use_live_prices:
             progress_ph.text(f"⏳ 正在通过 Baostock 拉取 T={t_date} 收盘价（{len(all_symbols)} 只标的）...")
             t_prices = fetch_point_close(all_symbols, t_date)
             t_prices = t_prices.rename(columns={"close": "close_t"})
@@ -1098,7 +1163,35 @@ def main():
         progress_ph.empty()
 
         if prices_df["close_t"].notna().sum() == 0:
-            st.warning(f"🔕 T={t_date} 无交易数据（非交易日或数据未更新）"); st.stop()
+            cached_dates = get_cached_trade_dates(db_path)
+            fallback_dates = [d for d in cached_dates if d < t_date]
+            if fallback_dates:
+                fallback_t = fallback_dates[0]
+                fallback_t1 = fallback_dates[1] if len(fallback_dates) > 1 else None
+                st.info(f"🔁 T={t_date} 暂无行情，自动回退到最近已缓存交易日 **{fallback_t}**")
+                t_date, t1_date = fallback_t, fallback_t1
+                date_source = "fallback_latest_cached_after_missing_t"
+                use_live_prices = False
+                progress_ph.text(f"⏳ 正在从本地缓存读取 T={t_date} 收盘价...")
+                t_prices = _fetch_close_from_cache(all_symbols, t_date)
+                if "close" in t_prices.columns:
+                    t_prices = t_prices.rename(columns={"close": "close_t"})
+                else:
+                    t_prices["close_t"] = np.nan
+                if t1_date:
+                    t1_prices = _fetch_close_from_cache(all_symbols, t1_date)
+                    if "close" in t1_prices.columns:
+                        t1_prices = t1_prices.rename(columns={"close": "close_t_minus_1"})
+                    else:
+                        t1_prices["close_t_minus_1"] = np.nan
+                    prices_df = t_prices.merge(t1_prices, on="symbol", how="left")
+                else:
+                    prices_df = t_prices.copy()
+                    prices_df["close_t_minus_1"] = np.nan
+                progress_ph.empty()
+            if prices_df["close_t"].notna().sum() == 0:
+                st.warning(f"🔕 T={t_date} 无交易数据（非交易日或数据未更新）")
+                st.stop()
 
         # ────────────────────────────────────────────────
         # Step 4: 并行计算（在数据就绪后同时进行）
@@ -1131,7 +1224,7 @@ def main():
         # ── 汇总行 ──
         st.caption(
             f"T={t_date} ｜ T-1={t1_date or 'N/A'} ｜ "
-            f"调仓月 {ym} ｜ 有效持仓 {metrics['n_stocks']}/{TOP_N}"
+            f"调仓月 {ym} ｜ 有效持仓 {metrics['n_stocks']}/{TOP_N} ｜ 日期模式 {date_source}"
         )
 
         # 🔴 风控雷达（置顶）
@@ -1166,7 +1259,7 @@ def main():
         # 页脚
         st.divider()
         st.caption(
-            f"数据来源: {'Baostock' if use_baostock else '本地缓存 (Baostock 不可用)'} + SQLite Market Cache · "
+            f"数据来源: {'Baostock' if use_live_prices else '本地缓存'} + SQLite Market Cache · "
             f"更新时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
             f"`{db_path}`"
         )
