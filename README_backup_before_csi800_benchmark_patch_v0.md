@@ -4,9 +4,9 @@
 
 本项目是一个量化研究管线，当前主线用于 Clean V0 strict-lag 策略评估，以及 `robust_cleaned` benchmark attribution。`robust_cleaned` 不是新的 portfolio strategy，不带 alpha/weights；它是用于分析 Clean V0 的基准、因子和特征归因框架。
 
-当前暂停点：CSI800 official market price-index benchmark addendum 已完成，并已补丁进 sealed attribution report。当前阶段进入 CSI800 纳入后的复核/诊断入口，不直接进入 V7、blend、production、live trading、模型训练、SHAP 或策略优化。
+当前暂停点：`Robust_Cleaned_Attribution_Report_Seal_v0` 已完成并封存 caveats。当前阶段进入 report seal 后的复核/诊断入口，不直接进入 V7、blend、production、live trading、模型训练、SHAP 或策略优化。
 
-当前推荐下一任务：`V0_Improvement_Diagnostic_v0`。
+当前推荐下一任务：`Attribution_Robustness_Check_v0`。
 
 ## Current Project Status / Robust Cleaned Attribution Status
 
@@ -15,50 +15,29 @@
 | Clean V0 official baseline | completed | 2017-03 至 2026-05，109 个月，net 20bps Sharpe 0.4051 | legacy leakage variant 不得作为 clean evidence |
 | robust_cleaned attribution inputs | completed | Monthly EW / FF5 / DGTW 输入已登记并完成 common-month policy | 不允许 silent inner join |
 | Unified V0 Alpha Attribution | completed with caveats | 109 个月统一归因完成；robust positive alpha 未建立 | 不得仅凭 FF5 intercept 宣称强 alpha |
-| Robust Cleaned Attribution Report Seal | completed with caveats | report 已封存；caveats 保留 | seal 后仍不允许直接 V7/blend/production |
-| CSI800 official benchmark addendum | completed with price-index caveats | `CSI800_OFFICIAL_BENCHMARK_ADDENDUM_READY_WITH_PRICE_INDEX_CAVEATS`；primary window 2017-03 至 2026-05 | CSI800_AKSHARE_PRICE 不是 total return index |
-| Attribution report patched with CSI800 | completed | `ROBUST_CLEANED_ATTRIBUTION_REPORT_PATCHED_WITH_CSI800_PRICE_INDEX_CAVEATS`；attribution views after patch = 4 | cross-framework conclusion unchanged |
-| README status | updated | README 已补充 CSI800 official market benchmark baseline | 继续保持 caveats 和 guardrails |
-| Current pause point | after CSI800 attribution report patch | 当前暂停点为 CSI800 price-index addendum 纳入后的复核/诊断入口 | 不直接进入策略上线链路 |
-| Recommended next task | `V0_Improvement_Diagnostic_v0` | 推荐先做 V0 改进诊断 | V7 只能先做独立 source audit |
-| V7 / blend / production | not allowed | robust positive alpha established after patch = `false` | 禁止 direct V7、direct blend、production、live trading、model training、strategy optimization |
+| Robust Cleaned Attribution Report Seal | completed with caveats | `ROBUST_CLEANED_ATTRIBUTION_REPORT_SEALED_WITH_CAVEATS`；attribution_month_count = 109 | seal 后仍不允许直接 V7/blend/production |
+| README status | updated | README 已补丁到 attribution report seal 之后状态 | 继续保持 caveats 和 guardrails |
+| Current pause point | after attribution report seal | 当前暂停点为 report seal 后的复核/诊断入口 | 不直接进入策略上线链路 |
+| Recommended next task | `Attribution_Robustness_Check_v0` | 推荐先复核 attribution robustness | V7 只能先做独立 source audit |
+| V7 / blend / production | not allowed directly | 仍禁止 direct V7、blend、production、live trading、training、SHAP、strategy optimization | 先完成独立审计或诊断 |
 
-### Benchmark Framework
-
-| 视角 | 类型 | 用途 | Caveat |
-|---|---|---|---|
-| Monthly EW | 内部等权股票 baseline | 判断 Clean V0 是否跑赢平均股票收益 | 194 vs 197 月份差异必须显式处理 |
-| CSI800_AKSHARE_PRICE | official market price-index benchmark，中证800价格指数，AKShare，000906 | 判断是否显著跑赢中证800价格指数 | 不是 total return index；不能解释为 total-return alpha |
-| FF5 | prebuilt CSMAR factor attribution，float-market-value weighted series 1 | 因子归因与 intercept 检查 | 无独立 RF，正 intercept 是 caveated raw-return evidence |
-| DGTW | characteristic-matched benchmark，IsNotBSE=1 primary filter | 特征匹配 benchmark attribution | IsNotBSE 是 universe filter，不是 cell key |
-
-### CSI800 Addendum Results
+### Main Sealed Attribution Conclusion
 
 | 指标 | 值 |
 |---|---:|
-| primary window | 2017-03 至 2026-05 |
-| month count | 109 |
-| active mean monthly return | 0.001100054006561199 |
-| active t-stat | 0.3036755551192249 |
-| alpha intercept | 0.002489852216672572 |
-| alpha HAC t-stat | 0.7642625869644408 |
-| beta | 0.711603974296172 |
-| R² | 0.5286518938964992 |
-| outperformance supported | `false` |
+| robust_positive_alpha_established | `false` |
+| ff5_positive_caveated_intercept | `true` |
+| dgtw_positive_alpha_established | `false` |
+| monthly_ew_active_mean_monthly_return | -0.0015323185516221286 |
+| monthly_ew_active_tstat | -0.1955400000307503 |
+| ff5_intercept | 0.008045150824189334 |
+| ff5_intercept_hac_tstat | 1.972124832012735 |
+| ff5_r_squared | 0.06848374996046935 |
+| dgtw_adjusted_mean_monthly_return | -0.010882826422018347 |
+| dgtw_adjusted_hac_tstat | -2.3892155373000814 |
+| dgtw_matched_weight_share_avg | 0.9977981651376148 |
 
-### Updated Cross-Framework Conclusion
-
-| 视角 | 结论 |
-|---|---|
-| Monthly EW | 不支持显著正超额。 |
-| CSI800_AKSHARE_PRICE | 不支持显著跑赢中证800价格指数。 |
-| FF5 | 正的 caveated raw-return intercept，但不能单独证明强 alpha。 |
-| DGTW | 负的 characteristic-adjusted return。 |
-| Cross-framework | robust positive alpha remains not established；加入 CSI800 后 cross-framework conclusion 没变。 |
-
-### Price Index Caveat
-
-`CSI800_AKSHARE_PRICE` 是中证800价格指数，来自 AKShare，代码 `000906`。它不是中证800全收益指数，不能把 price-index-relative 结果解释为 total-return alpha。如果未来需要中证800全收益指数，需要单独执行 `CSI800_Total_Return_Index_Source_Audit_v0`。
+归因报告已封存，但结论仍是：robust positive alpha 未建立；FF5 正 intercept 只能作为 caveated raw-return evidence；DGTW positive alpha 未建立。V7 / blend / production 仍不允许直接推进。
 
 ## Critical Route Corrections
 
@@ -138,23 +117,21 @@ Policy excluded months: `2017-02`, `2017-04`, `2018-02`。
 
 | 类型 | 任务 | 说明 |
 |---|---|---|
-| 推荐 | `V0_Improvement_Diagnostic_v0` | CSI800 price-index addendum 纳入后，优先诊断 V0 如何改进。 |
-| 条件可选 | `Attribution_Robustness_Check_v0` | 仅当需要进一步 sensitivity / robustness 复核时执行。 |
-| 可选 source audit | `CSI800_Total_Return_Index_Source_Audit_v0` | 如果未来需要中证800全收益指数，先单独审计 total return source。 |
-| 独立审计分支 | `V7_Source_Audit_v0` | 仅作为 separate audit branch；不得直接进入 V7。 |
+| 推荐 | `Attribution_Robustness_Check_v0` | report seal 后先复核 attribution robustness。 |
+| 可选诊断 | `V0_Improvement_Diagnostic_v0` | 若目标是改进 V0，先做诊断，不直接优化策略。 |
+| 独立审计分支 | `V7_Source_Audit_v0` | 仅作为 separate audit branch；不得直接把当前结论转成 V7。 |
 
-直接禁止：direct V7、direct blend、production、live trading、model training、SHAP、strategy optimization。
+直接禁止：direct V7、direct blend、production、live trading、training、SHAP、strategy optimization。
 
 ## How to Resume
 
 | 目标 | 下一任务 |
 |---|---|
+| 检查归因稳健性 | `Attribution_Robustness_Check_v0` |
 | 改进 V0 | `V0_Improvement_Diagnostic_v0` |
-| 检查归因稳健性 | `Attribution_Robustness_Check_v0`，仅当需要进一步 sensitivity 时执行 |
-| 审计中证800全收益指数来源 | `CSI800_Total_Return_Index_Source_Audit_v0` |
 | 开新策略审计分支 | 先运行 `V7_Source_Audit_v0`，并作为 separate audit branch |
 
-如 Codex 会话中断，先读取 `output/readme_patch_csi800_benchmark_status_v0/RUN_STATE.md`，再继续本文档补丁任务。
+如 Codex 会话中断，先读取 `output/readme_patch_after_attribution_report_seal_v0/RUN_STATE.md`，再继续本文档补丁任务。
 
 ## Deprecated / Historical Notes
 
