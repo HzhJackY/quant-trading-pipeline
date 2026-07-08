@@ -1,0 +1,13 @@
+{
+  "project_name": "quant",
+  "default_command": "python paper_trading/paper_trading_pipeline.py",
+  "default_timeout_minutes": 45,
+  "log_dir": "logs/daily_monitor",
+  "status_dir": "output/project_monitoring",
+  "notify_on_success": true,
+  "notify_on_failure": true,
+  "known_notes": [
+    "Current paper trading may still output Top30, while production candidate is Compact-F + Top50 Buffer 35/75.",
+    "Market timing is baseline / monitor-only unless explicitly enabled by existing pipeline."
+  ]
+}

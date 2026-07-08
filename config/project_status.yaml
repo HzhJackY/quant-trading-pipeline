@@ -1,0 +1,56 @@
+project:
+  name: A-share Quant Shadow Trading System
+  current_phase: shadow_monitoring
+  last_updated: '2026-06-30'
+production:
+  active_model: legacy_paper_trading
+  status: not_replaced
+  notes: Current paper_trading main logic has not been replaced.
+shadow_candidate:
+  name: BLEND_V0_50_V7_50_TOP50_BUFFER_V3
+  status: SHADOW_CANDIDATE_NOT_PRODUCTION
+  panel: output/training_panel_v15_sr.parquet
+  portfolio_rule: Top50 Buffer 35/75
+  sharpe: 1.509353
+  max_drawdown: -0.107414
+  monthly_turnover: 0.18729
+  latest_feature_month: 2026-06-30
+  latest_holding_count: 50
+  dashboard: monitoring/blend_v3_shadow_report.py
+  monitor_task: QuantBlendV3ShadowDailyMonitor
+compact_f:
+  status: baseline_or_style_reference
+  notes: No longer sole default production candidate.
+v0:
+  status: main_alpha_component
+  artifact: output/full_panel_forced_tournament_v3/V0_FULL_V15_OOS.parquet
+v7:
+  status: ml_component
+  artifact: output/full_panel_forced_tournament_v3/V7_FULL_V15_OOS.parquet
+alternative_data:
+  media15_status: sealed_research_only
+  xhs_status: sealed_mechanism_research
+  baidu_status: sealed_exploratory
+  csmar_status: trd_dalyr_market_cap_monthly_source_imported_pending_unit_alignment_and_factor_rebuild
+  csmar_latest_task: CSMAR TRD_Dalyr Market Cap Import Lite v1
+  csmar_latest_output: output/csmar_trd_dalyr_market_cap_import_lite_v1
+  csmar_location: data_sources/csmar
+  csmar_legacy_location: xhs/scripts and xhs/output legacy reference
+docs:
+  current_status: docs/CURRENT_STATUS.md
+  decisions: docs/DECISIONS.md
+  roadmap: docs/ROADMAP.md
+  data_dependencies: docs/DATA_DEPENDENCIES.md
+  model_registry: docs/MODEL_REGISTRY.md
+  readme_sync_policy: docs/README_SYNC_POLICY.md
+validation:
+  pit_financial_status: strict_actual_pit_core_fs_source_panel_built_market_cap_imported_unit_alignment_pending
+  blend_v3_historical_metrics_status: under_pit_review
+research:
+  price_volume_reversal_status: refinement_still_fragile
+  price_volume_reversal_latest_task: PV Reversal Fragility Attribution & Refinement
+    v1
+  price_volume_reversal_latest_output: output/pv_reversal_fragility_refinement_v1
+  alpha008_status: audit_completed
+  alpha008_latest_task: Alpha008 A-Share Reversal Factor Audit v1
+  alpha008_latest_output: output/alpha008_a_share_reversal_audit_v1

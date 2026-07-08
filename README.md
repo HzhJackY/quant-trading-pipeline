@@ -1,218 +1,572 @@
-# Quant Factor Research — A 股多因子选股系统
+# Quant Research Project
 
-从因子研究到纸交易的生产级量化选股管线。核心系统是 **Split-Universe 双模型架构**
-（大盘/小盘分层因子建模），配合从 Linear → LightGBM → LambdaRank → Turnover-Aware 的
-完整 ML 实验链，以及交易成本建模和 GARCH 风险管理。
+## Project Overview
 
-## 核心结论
+本项目是一个量化研究管线，当前主线用于 Clean V0 strict-lag 策略评估，以及 `robust_cleaned` benchmark attribution。`robust_cleaned` 不是新的 portfolio strategy，不带 alpha/weights；它是用于分析 Clean V0 的基准、因子和特征归因框架。
 
-| 指标 | 线性 Alpha (V0) | ML V7 (TO-Aware) | 说明 |
-|------|:---:|:---:|------|
-| **Net Sharpe** | **1.13** | 0.98 | 线性因子模型优于所有 ML 变体 |
-| Max Drawdown | −18% | −27% | ML 的 3M gap 是结构性回撤根因 |
-| Monthly Turnover | 23.7% | 12.6% | TO-Aware loss 有效控换手 |
-| Monthly Cost | 5.9 bps | 3.3 bps | 低换手 → 低成本 |
+当前暂停点：CSI800 official market price-index benchmark addendum 已完成，并已补丁进 sealed attribution report。当前阶段进入 CSI800 纳入后的复核/诊断入口，不直接进入 V7、blend、production、live trading、模型训练、SHAP 或策略优化。
 
-> **诚实结论**：在当前 A 股中证 800 因子体系下，线性 IC_IR 加权合成的稳健性优于
-> 机器学习模型的复杂度收益。ML 实验链完整记录了每一版的设计动机、消融对比和失败分析 —
-> 这种"证伪"过程本身是量化研究的方法论核心。
+当前推荐下一任务：`V0_Improvement_Diagnostic_v0`。
 
-完整的消融实验链：`output/ml_v7_final_report.md`
+## Current Project Status / Robust Cleaned Attribution Status
 
-## 项目结构
+| 模块 | 当前状态 | 关键结论 | 下一步限制 |
+|---|---|---|---|
+| Clean V0 official baseline | completed | 2017-03 至 2026-05，109 个月，net 20bps Sharpe 0.4051 | legacy leakage variant 不得作为 clean evidence |
+| robust_cleaned attribution inputs | completed | Monthly EW / FF5 / DGTW 输入已登记并完成 common-month policy | 不允许 silent inner join |
+| Unified V0 Alpha Attribution | completed with caveats | 109 个月统一归因完成；robust positive alpha 未建立 | 不得仅凭 FF5 intercept 宣称强 alpha |
+| Robust Cleaned Attribution Report Seal | completed with caveats | report 已封存；caveats 保留 | seal 后仍不允许直接 V7/blend/production |
+| CSI800 official benchmark addendum | completed with price-index caveats | `CSI800_OFFICIAL_BENCHMARK_ADDENDUM_READY_WITH_PRICE_INDEX_CAVEATS`；primary window 2017-03 至 2026-05 | CSI800_AKSHARE_PRICE 不是 total return index |
+| Attribution report patched with CSI800 | completed | `ROBUST_CLEANED_ATTRIBUTION_REPORT_PATCHED_WITH_CSI800_PRICE_INDEX_CAVEATS`；attribution views after patch = 4 | cross-framework conclusion unchanged |
+| README status | updated | README 已补充 CSI800 official market benchmark baseline | 继续保持 caveats 和 guardrails |
+| Current pause point | after CSI800 attribution report patch | 当前暂停点为 CSI800 price-index addendum 纳入后的复核/诊断入口 | 不直接进入策略上线链路 |
+| Recommended next task | `V0_Improvement_Diagnostic_v0` | 推荐先做 V0 改进诊断 | V7 只能先做独立 source audit |
+| V7 / blend / production | not allowed | robust positive alpha established after patch = `false` | 禁止 direct V7、direct blend、production、live trading、model training、strategy optimization |
 
+### Benchmark Framework
+
+| 视角 | 类型 | 用途 | Caveat |
+|---|---|---|---|
+| Monthly EW | 内部等权股票 baseline | 判断 Clean V0 是否跑赢平均股票收益 | 194 vs 197 月份差异必须显式处理 |
+| CSI800_AKSHARE_PRICE | official market price-index benchmark，中证800价格指数，AKShare，000906 | 判断是否显著跑赢中证800价格指数 | 不是 total return index；不能解释为 total-return alpha |
+| FF5 | prebuilt CSMAR factor attribution，float-market-value weighted series 1 | 因子归因与 intercept 检查 | 无独立 RF，正 intercept 是 caveated raw-return evidence |
+| DGTW | characteristic-matched benchmark，IsNotBSE=1 primary filter | 特征匹配 benchmark attribution | IsNotBSE 是 universe filter，不是 cell key |
+
+### CSI800 Addendum Results
+
+| 指标 | 值 |
+|---|---:|
+| primary window | 2017-03 至 2026-05 |
+| month count | 109 |
+| active mean monthly return | 0.001100054006561199 |
+| active t-stat | 0.3036755551192249 |
+| alpha intercept | 0.002489852216672572 |
+| alpha HAC t-stat | 0.7642625869644408 |
+| beta | 0.711603974296172 |
+| R² | 0.5286518938964992 |
+| outperformance supported | `false` |
+
+### Updated Cross-Framework Conclusion
+
+| 视角 | 结论 |
+|---|---|
+| Monthly EW | 不支持显著正超额。 |
+| CSI800_AKSHARE_PRICE | 不支持显著跑赢中证800价格指数。 |
+| FF5 | 正的 caveated raw-return intercept，但不能单独证明强 alpha。 |
+| DGTW | 负的 characteristic-adjusted return。 |
+| Cross-framework | robust positive alpha remains not established；加入 CSI800 后 cross-framework conclusion 没变。 |
+
+### Price Index Caveat
+
+`CSI800_AKSHARE_PRICE` 是中证800价格指数，来自 AKShare，代码 `000906`。它不是中证800全收益指数，不能把 price-index-relative 结果解释为 total-return alpha。如果未来需要中证800全收益指数，需要单独执行 `CSI800_Total_Return_Index_Source_Audit_v0`。
+
+## Critical Route Corrections
+
+| 主题 | 当前路线 |
+|---|---|
+| `robust_cleaned` 定义 | 不是策略分支，不应描述为有 alpha/weights 的组合策略；它是 Clean V0 的 benchmark / attribution framework。 |
+| FF5 来源 | 使用 CSMAR 预构建 `data/csmar_exports/STK_MKT_FIVEFACDAY.xlsx`，当前主线不从 `TRD_Mnth.xlsx`、`FS_Combas.xlsx` 或 `FS_Comins.xlsx` 自建 FF5。 |
+| FF5 读取规则 | `header=0, skiprows=[1,2]`；第 1 行为字段名，第 2/3 行为描述/单位，第 4 行起为数据；不要使用 `header=3`。 |
+| FF5 语义 | primary selected = 1-series，即 float-market-value weighted；无独立 RF，`RiskPremium1` 用作 `mkt_rf`。 |
+| DGTW 来源 | 使用 CSMAR 预构建 `data/csmar_exports/STK_MKT_DGTWASSINGMENTS.xlsx` 和 `data/csmar_exports/STK_MKT_DGTWBENCH.xlsx`；文件名是 `ASSINGMENTS`，不是 `ASSIGNMENTS`。 |
+| DGTW 读取规则 | `header=0, skiprows=[1,2]`；当前主线不自建 DGTW。 |
+| leakage | legacy leakage variant 不能作为 clean evidence；Clean V0 strict-lag 是官方 baseline。 |
+| 月份对齐 | 不允许 silent inner join；月份缺失、policy exclusion 和 common window 必须显式记录。 |
+
+## Main Results
+
+### Clean V0 Official Baseline
+
+| 指标 | 数值 |
+|---|---:|
+| official window | 2017-03 至 2026-05 |
+| official month count | 109 |
+| net 20bps Sharpe | 0.4050573915950944 |
+| net 20bps mean monthly return | 0.005919115596330279 |
+| net 20bps t-stat | 1.2207850091558083 |
+| cumulative return | 0.6628369485932033 |
+| max drawdown | -0.32474926666288617 |
+
+Policy excluded months: `2017-02`, `2017-04`, `2018-02`。
+
+### Unified Attribution Results
+
+| 框架 | 结果 | 解读 |
+|---|---:|---|
+| Monthly EW active mean monthly return | -0.0015323185516221286 | Clean V0 未显著跑赢平均股票基准；active return 略负且统计不显著，t-stat = -0.1955400000307503。 |
+| FF5 intercept | 0.008045150824189334 | intercept 为正，普通 t-stat = 1.556500596198002，HAC t-stat = 1.972124832012735，但因为无独立 RF，只能视为 raw-return caveated alpha。 |
+| FF5 R-squared | 0.06848374996046935 | 因子解释度较低，不能单凭 intercept 宣称强 alpha。 |
+| DGTW adjusted mean monthly return | -0.010882826422018347 | DGTW adjusted return 为负，t-stat = -1.597945458324844，HAC t-stat = -2.3892155373000814。 |
+| DGTW matched weight share avg | 0.9977981651376148 | 匹配权重占比较高，但 caveat 仍需保留。 |
+
+总体结论：Clean V0 在 robust_cleaned 的 Monthly EW、FF5、DGTW 框架下没有建立稳健正 alpha。FF5 intercept 的正值需要 `no independent RF` caveat；DGTW 调整后收益为显著负值。不得基于单一 FF5 intercept 直接推进 V7、blend 或 production。
+
+## Artifact Index
+
+| 组件 | 关键文件 | 作用 |
+|---|---|---|
+| Clean V0 registry | `output/clean_v0_baseline_registry_v0/clean_v0_baseline_registry_summary.json` | 官方 clean strict-lag baseline 状态 |
+| Data Market Contract | `output/data_market_contract_seal_recheck_with_iar_pit_source_v0/data_market_contract_iar_recheck_summary.json` | PIT calendar 与 forecast calendar 合约 |
+| Monthly EW ladder | `output/monthly_equal_weight_baseline_ladder_v0/monthly_ew_ladder_summary.json` | 平均股票 baseline ladder |
+| Monthly EW returns | `output/monthly_equal_weight_baseline_ladder_v0/monthly_ew_ladder_combined_returns.parquet` | 月频 baseline returns；优先 parquet，不读大型 xlsx |
+| FF5 source QA | `output/ff5_prebuilt_cn_factor_source_qa_v0/ff5_prebuilt_source_qa_summary.json` | FF5 预构建源文件语义确认 |
+| FF5 monthly alignment | `output/ff5_prebuilt_cn_factor_monthly_alignment_v0/ff5_monthly_alignment_summary.json` | FF5 月频对齐状态 |
+| FF5 aligned factors | `output/ff5_prebuilt_cn_factor_monthly_alignment_v0/ff5_monthly_primary_aligned_factors.parquet` | 月频 FF5 因子输入 |
+| DGTW source QA | `output/dgtw_prebuilt_cn_benchmark_source_qa_v0/dgtw_source_qa_summary.json` | DGTW assignment / benchmark 源文件语义确认 |
+| DGTW monthly alignment | `output/dgtw_prebuilt_cn_benchmark_monthly_alignment_v0/dgtw_monthly_alignment_summary.json` | DGTW 月频 benchmark 对齐状态 |
+| DGTW benchmark panel | `output/dgtw_prebuilt_cn_benchmark_monthly_alignment_v0/dgtw_benchmark_primary_isnotbse1_monthly_panel.parquet` | primary IsNotBSE=1 benchmark panel |
+| Robust cleaned registry | `output/robust_cleaned_attribution_input_registry_v0/robust_cleaned_registry_summary.json` | attribution 输入登记与 common months |
+| Unified attribution | `output/unified_v0_alpha_attribution_v0/unified_attribution_summary.json` | Clean V0 统一归因总结 |
+| Unified attribution report | `output/unified_v0_alpha_attribution_v0/unified_attribution_report.md` | 归因报告草稿 |
+
+完整 artifact 索引见 `output/project_readme_update_robust_cleaned_status_v0/readme_artifact_index.csv`。
+
+## Caveats and Guardrails
+
+- FF5 无独立 RF，`RiskPremium1` 作为 `mkt_rf`，因此 FF5 intercept 是 raw-return caveated alpha。
+- DGTW matched weight share avg = 0.9977981651376148，但仍需保留匹配权重 caveat。
+- DGTW `IsNotBSE=1` 是 primary universe filter，不是 cell key；其他 `IsNotBSE` 值只能作为 sensitivity。
+- Monthly EW 为 194 个月，FF5/DGTW 为 197 个月；差异来自 Monthly EW 缺失 `2017-02`、`2017-04`、`2018-02`，不能 silent inner join。
+- Data Market Contract 状态为 `SEALED_WITH_CAVEATS`。
+- legacy outperformance 很大程度由 leakage variants 解释；不得使用 leakage variant 证明 clean alpha。
+- 不允许 zero-fill。
+- 不允许 matched-only renormalization。
+- 不允许 silent inner join。
+- 本 README 更新任务没有重新计算 returns、读取 Route B weights、修改 upstream artifacts 或进入 V7/blend/production。
+
+## Allowed Next Steps
+
+| 类型 | 任务 | 说明 |
+|---|---|---|
+| 推荐 | `V0_Improvement_Diagnostic_v0` | CSI800 price-index addendum 纳入后，优先诊断 V0 如何改进。 |
+| 条件可选 | `Attribution_Robustness_Check_v0` | 仅当需要进一步 sensitivity / robustness 复核时执行。 |
+| 可选 source audit | `CSI800_Total_Return_Index_Source_Audit_v0` | 如果未来需要中证800全收益指数，先单独审计 total return source。 |
+| 独立审计分支 | `V7_Source_Audit_v0` | 仅作为 separate audit branch；不得直接进入 V7。 |
+
+直接禁止：direct V7、direct blend、production、live trading、model training、SHAP、strategy optimization。
+
+## How to Resume
+
+| 目标 | 下一任务 |
+|---|---|
+| 改进 V0 | `V0_Improvement_Diagnostic_v0` |
+| 检查归因稳健性 | `Attribution_Robustness_Check_v0`，仅当需要进一步 sensitivity 时执行 |
+| 审计中证800全收益指数来源 | `CSI800_Total_Return_Index_Source_Audit_v0` |
+| 开新策略审计分支 | 先运行 `V7_Source_Audit_v0`，并作为 separate audit branch |
+
+如 Codex 会话中断，先读取 `output/readme_patch_csi800_benchmark_status_v0/RUN_STATE.md`，再继续本文档补丁任务。
+
+## Deprecated / Historical Notes
+
+以下内容为本次更新前 README 的完整保留版本。若其中内容与上方当前状态冲突，以上方 `Current Project Status / Robust Cleaned Attribution Status` 为准。
+
+<details>
+<summary>展开历史 README 内容</summary>
+
+# A 股基本面量化选股与 Shadow Paper Trading 系统
+
+当前项目已经从单一 Compact-F 候选，升级为 V0 Linear / V7 TO-Aware ML / Compact-F / Blend 的统一生产擂台与 shadow 监控系统。
+
+当前最强 shadow candidate 为：
+
+`BLEND_V0_50_V7_50 + Top50 Buffer 35/75`
+
+状态：
+
+`SHADOW_CANDIDATE_NOT_PRODUCTION`
+
+这意味着：
+
+- 已通过 v3 full panel OOS 擂台；
+- 已通过 production review gate；
+- 已生成 live shadow holdings；
+- 已接入 shadow dashboard 和每日自动更新；
+- 但尚未替换正式 production；
+- 尚未生成真实交易订单；
+- 需要 shadow 观察 1-3 个月后再决定是否晋升。
+
+## 当前状态
+
+- `BLEND_V0_50_V7_50 + Top50 Buffer 35/75` 是当前最强 production shadow candidate。
+- 当前状态是 `SHADOW_CANDIDATE_NOT_PRODUCTION`，不替换当前 production，不替换当前 paper_trading 主逻辑。
+- 当前不做实盘交易指令，不生成真实订单，不覆盖当前 paper trading 持仓。
+- Blend V3 已进入 shadow live monitoring，每日自动任务已安装或准备安装。
+- Shadow dashboard 已中文化，股票代码前导 0 显示问题已修复。
+- Compact-F 不再是唯一默认生产候选，保留为基本面可解释 baseline / 风格对照模型。
+- Media15 / XHS / 百度指数仍然是独立另类数据研究线，不进入主 alpha。
+
+## 核心结果
+
+Full Panel Forced Tournament v3：
+
+- `main_panel_path = output\training_panel_v15_sr.parquet`
+- `median_symbols_per_month_main_panel = 714`
+- `best_full_panel_model = BLEND_V0_50_V7_50`
+- `best_full_panel_portfolio_rule = Top50_Buffer_35_75`
+- `best_full_panel_net_sharpe = 1.509353`
+- `best_full_panel_max_drawdown = -0.107414`
+- `best_full_panel_turnover = 0.187290`
+- `v0_available = True`
+- `v7_available = True`
+- `compact_f_available = True`
+- `leakage_detected = False`
+- `decision = FULL_PANEL_TOURNAMENT_V3_READY_FOR_REVIEW`
+
+Production Candidate v3 Review：
+
+- `review_gate_pass = True`
+- `shadow_holdings_generated = True`
+- `candidate_status = SHADOW_CANDIDATE_NOT_PRODUCTION`
+- `decision = BLEND_V3_SHADOW_MODE_READY`
+- 不建议直接替换 production，建议进入 paper trading shadow mode。
+
+当前候选结果表，指标来源为 `output\full_panel_forced_tournament_v3\tournament_v3_full_panel_metrics.csv`：
+
+| 候选 | 数据面板 | 组合规则 | Net Sharpe | MaxDD | 月换手 | 状态 |
+|---|---|---|---:|---:|---:|---|
+| BLEND_V0_50_V7_50 | training_panel_v15_sr | Top50 Buffer 35/75 | 1.509 | -10.74% | 18.73% | Shadow Candidate |
+| V0_FULL_V15_OOS | training_panel_v15_sr | Top50 Buffer 35/75 | 1.147 | -9.87% | 9.47% | 单模型候选 |
+| V7_FULL_V15_OOS | training_panel_v15_sr | Top50 Buffer 35/75 | 1.206 | -12.43% | 36.70% | ML 辅助候选 |
+| Compact-F | training_panel_v15_sr / aligned | Top50 Buffer 35/75 | 0.273 | -31.97% | 27.00% | 基本面对照 / 风格解释 |
+
+说明：v3 Sharpe 是历史 OOS 回测结果，不保证未来实盘表现，也不代表已上线实盘。
+
+## 模型定位
+
+### BLEND_V0_50_V7_50
+
+- 当前最强 shadow candidate。
+- 由 V0 Linear OOS 与 V7 TO-Aware OOS 的标准化分数组合。
+- `blend_score = 0.50 * V0_score_z + 0.50 * V7_score_z`
+- 使用 `Top50 Buffer 35/75`。
+- 当前只用于 shadow monitoring，不用于真实交易指令。
+
+### V0 Linear
+
+- 当前完整 v15 panel 上重新生成严格 OOS。
+- 不再使用旧 `split_universe_blended` artifact 作为最终依据。
+- 是主 alpha engine 的核心组成部分。
+
+### V7 TO-Aware ML
+
+- 当前完整 v15 panel 上固定规格重训。
+- 不做超参数搜索。
+- 用于提供 ML 辅助信号和稳定性。
+- 与 V0 blend 后表现最佳。
+
+### Compact-F
+
+- 不再作为唯一默认 production candidate。
+- 保留为基本面可解释 baseline / 风格对照。
+- 历史 Compact-F 结论保留在“历史候选与模型治理”部分。
+- 不是失败模型，而是风格干净但收益风险不及 v3 Blend。
+
+## Blend V3 Shadow Live Monitoring
+
+Shadow Live 当前状态：
+
+- `candidate_status = SHADOW_CANDIDATE_NOT_PRODUCTION`
+- `latest_feature_month = 2026-06-30`
+- `shadow_holding_count = 50`
+- `tradability_pass_count = 526`
+- `stale_feature_warning = False`
+- `decision = BLEND_V3_SHADOW_LIVE_READY`
+- QA 全部通过。
+
+关键文件：
+
+- dashboard：`monitoring\blend_v3_shadow_report.py`
+- latest holdings：`output\blend_v3_shadow_live\latest_shadow_holdings_live.csv`
+- latest report：`output\blend_v3_shadow_live\latest_shadow_report_live.md`
+- NAV tracker：`output\blend_v3_shadow_monitoring\shadow_daily_nav.csv`
+- latest status：`output\blend_v3_shadow_monitoring\shadow_monitor_latest_status.json`
+
+这是影子组合，不是正式 production，不是交易指令，不生成真实订单。
+
+## Shadow Daily Automation
+
+查看 shadow 状态：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check_blend_v3_shadow_daily_status.ps1
 ```
+
+手动触发 shadow 任务：
+
+```powershell
+schtasks /Run /TN QuantBlendV3ShadowDailyMonitor
+```
+
+打开中文 shadow dashboard：
+
+```powershell
+streamlit run monitoring\blend_v3_shadow_report.py
+```
+
+手动运行 shadow update：
+
+```powershell
+cmd /c scripts\run_blend_v3_shadow_live_update.bat
+```
+
+安装每日任务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_blend_v3_shadow_daily_task.ps1
+```
+
+任务信息：
+
+- `task_name: QuantBlendV3ShadowDailyMonitor`
+- `schedule: 周一到周五 18:25，本地时间`
+- `status: shadow only`
+- `shadow update bat = scripts\run_blend_v3_shadow_live_update.bat`
+- `dashboard = monitoring\blend_v3_shadow_report.py`
+- `status check = scripts\check_blend_v3_shadow_daily_status.ps1`
+
+## Project Structure
+
+```text
 quant/
-├── data/
-│   ├── fetcher.py                  # 数据获取 (日线/成分股/财务, PIT 对齐)
-│   └── cleaner.py                  # 预处理 (MAD 去极值/行业中性化/Z-score)
-│
-├── factor_lib/                     # 16 因子库 (被 run_factor_research.py 引用)
-│   ├── value.py                    #   BP, EP (估值)
-│   ├── momentum.py                 #   Mom_1M, 3M, 6M, 12M-1M (动量)
-│   ├── quality.py                  #   ROE, Debt_Ratio, Net_Profit_Margin (质量)
-│   ├── volatility.py               #   Vol_20D, 60D, Beta (波动率)
-│   ├── growth.py                   #   RevGrowth_YoY, ProfitGrowth_YoY (成长)
-│   └── technical.py                #   VolChg_20D, PriceDev_20D (技术面)
-│
-├── factor_research/
-│   ├── ic_analysis.py              # Rank IC / IC_IR / IC 衰减分析
-│   ├── group_backtest.py           # 5 分组回测 + 多空组合
-│   ├── backtest_engine.py          # 多因子合成 (IC_IR 加权/去冗余/符号翻转)
-│   ├── split_universe.py           # ★ Split-Universe 双模型系统
-│   ├── report.py                   # 可视化 (IC 图/净值/相关性矩阵)
-│   ├── dynamic_weight.py           # 动态权重分配 (IC_IR 衰减 + Vol 调整)
-│   ├── transaction_cost.py         # 分层交易成本模型 (Almgren-Chriss 冲击)
-│   ├── ml_engine.py                # ML 基础引擎 (Walk-Forward CV)
-│   ├── ml_engine_v7.py             # ★ V7 终版: 1M label + 0M gap + TO-Aware
-│   ├── ml_engine_v2.py             # [归档] LambdaRank 实验
-│   ├── ml_engine_v5.py             # [归档] TO-Aware 3M gap 实验
-│   ├── ml_engine_v6.py             # [归档] Label Blending + Time-Decay
-│   └── production_engine.py        # 生产引擎 (3-seed ensemble, 模型持久化)
-│
-├── paper_trading/                  # 纸交易生产管线
-│   ├── paper_trading_pipeline.py   # ★ 每日 cron 入口 + 月末调仓编排
-│   ├── data_ingestion.py           # 日线行情 + 基本面并行数据获取
-│   ├── factor_compute.py           # 16 因子实时计算
-│   ├── state_manager.py            # 信号锚点持久化 + 市场缓存 SQLite
-│   └── baostock_adapter.py         # Baostock PIT 财务数据适配 (零前看偏差)
-│
-├── output/                         # 回测输出 + ML 预测 + 报告
-│   ├── ml_v7_final_report.md       # ★ 最终消融报告 (V0 vs V5 vs V7)
-│   ├── factor_ic_summary.csv       # 因子 IC 汇总
-│   └── production_models/          # 训练好的生产模型 (54 folds × 3 seeds)
-│
-├── tests/                          # 单元测试
-├── resume/                         # 中英文简历
-├── run_factor_research.py          # ★ 主入口: 4 阶段因子研究流水线
-├── run_split_universe.py           # Split-Universe 双模型分析
-├── run_backtest_with_costs.py      # 成本感知回测
-├── run_ml_v7.py                    # ★ V7 终版 ML 训练 + 回测
-├── run_ml_v6.py                    # V6 消融对比
-├── requirements.txt                # 环境依赖 (版本锁定)
-└── .gitignore
+├── factor_research/                 # 因子分析、成本回测、择时 baseline、回测引擎
+├── paper_trading/                   # paper trading（纸交易）生产管线，当前不被 Blend V3 自动替换
+├── monitoring/                      # Streamlit 每日风控看板与 Blend V3 shadow dashboard
+├── factor_lib/                      # 因子定义与扩展因子模块
+├── data/                            # 数据抓取、缓存与清洗模块
+├── output/                          # 报告、模型、回测结果与研究产物
+├── scripts/                         # 一次性脚本、审计脚本、自动任务脚本、报告生成脚本
+├── tests/                           # 单元测试
+├── xhs/                             # 另类数据研究工作区（独立研究或辅助目录）
+├── research/                        # 研究草稿与补充材料（独立研究或辅助目录）
+├── MediaCrawler/                    # 另类数据采集实验目录（独立研究或辅助目录）
+├── run_compact_f_production_validation.py # Compact-F 历史生产候选验证入口
+├── run_v15_portfolio_optimization.py # 组合层优化与 Top50 Buffer 评估
+├── run_backtest_with_costs.py       # 成本感知回测
+├── run_timing_comparison.py         # 择时 baseline 对比
+├── requirements.txt                 # 环境依赖
+└── README.md
 ```
 
-## Runner 脚本指南
+## Paper Trading（纸交易）
 
-| 脚本 | 用途 | 状态 |
-|------|------|:--:|
-| `run_factor_research.py` | 主入口 — 4 阶段因子研究流水线 (数据预取→面板构建→预处理→分析) | ★ 活跃 |
-| `run_split_universe.py` | Split-Universe 大盘/小盘双模型分析 + Baseline 对比 | ★ 活跃 |
-| `run_backtest_with_costs.py` | 带交易成本的分层回测 (佣金+印花税+冲击) | ★ 活跃 |
-| `run_ml_v7.py` | V7 终版: 1M label + 0M gap + TO-Aware — 训练 + V0/V5/V7 对比 | ★ 活跃 |
-| `run_ml_v6.py` | V6 Label Blending + Time-Decay 消融对比 | 保留 |
-| `run_ml_backtest.py` | ML 信号 vs 线性信号回测对比 | 保留 |
-| `run_dynamic_weight.py` | 动态权重分配 (IC_IR 衰减 + 波动率调整) | 保留 |
-| `run_ml_ablation.py` | [归档] V0-V3 早期消融实验 | 归档 |
-| `run_ml_lambdarank.py` | [归档] LambdaRank 回测 | 归档 |
-| `run_ml_turnover_aware.py` | [归档] V5 λ sweep 实验 | 归档 |
-| `diagnose_stock_pool.py` | 股票池诊断 — 采样方法对比 + 行业覆盖分析 | 工具 |
+当前纸交易入口：`paper_trading/paper_trading_pipeline.py`
 
-## 快速开始
+定位：
+
+- 服务于当前 production / paper trading 主逻辑的模拟运行与执行编排。
+- Blend V3 当前不替换 `paper_trading/paper_trading_pipeline.py`。
+- 当前不覆盖已有 paper trading 持仓。
+- 月末调仓。
+- 先做物理风控过滤，再做 universe alignment（股票池对齐）与信号输出。
+
+当前实现中的物理风控过滤包括：
+
+- `ST / *ST`
+- 停牌
+- 日均成交额低于 5000 万
+- 总市值低于 50 亿
+
+当前实现中的核心链路：
+
+- `CSI800 universe alignment`
+- `cross_sectional_rank` 只在最终 universe 内计算
+- `signal anchor` 持久化上期与当期信号
+
+常用命令：
 
 ```bash
-# 1. 环境安装
 pip install -r requirements.txt
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance -v
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance --force-refresh
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance --skip-ingestion
+```
 
-# 2. 因子研究流水线 (首次 ~40min, 缓存后秒过)
-python run_factor_research.py
+## Monitoring（监控看板）
 
-# 3. Split-Universe 双模型分析 (含 Baseline 对比)
-python run_split_universe.py
+当前主监控入口：`monitoring\daily_report.py`
 
-# 4. V7 终版 ML 训练 + 回测 (含 V0/V5/V7 三路对比)
-python run_ml_v7.py
+Blend V3 shadow 监控入口：`monitoring\blend_v3_shadow_report.py`
 
-# 5. 纸交易 (每日 cron, 16:00 收盘后运行)
-python paper_trading/paper_trading_pipeline.py
+看板内容包括：
 
-# 单元测试
+- 风控雷达
+- KPI 卡片
+- 累计净值
+- 因子暴露
+- 红黑榜
+- 全景持仓
+- Blend V3 shadow live holdings / NAV / status
+
+工程栈：
+
+- `Baostock + SQLite + Streamlit`
+
+使用方式：
+
+```bash
+streamlit run monitoring/daily_report.py
+streamlit run monitoring\blend_v3_shadow_report.py
+```
+
+说明：监控看板用于纸交易与风险复核，不等同于 alpha 证明。
+
+## 大盘择时 baseline：仅监控，不作为默认生产仓位
+
+当前规则：
+
+- 中证 500 `MA20/60` 死叉，或 20 日年化波动率超过 252 日 80% 分位时，仓位乘数降为 `0.3`。
+
+历史回测结果：
+
+- 无择时：Net Sharpe `1.13`，年化收益 `21.27%`，MaxDD `-18.01%`
+- 有择时：Net Sharpe `0.80`，年化收益 `10.66%`，MaxDD `-12.50%`
+
+结论：
+
+- 该择时方案可以降低回撤，但收益损失过大，Sharpe 恶化。
+- 当前参数不具备实盘默认价值。
+- 除非显式进行择时实验，否则 production 默认 `multiplier` 应保持 `1.0`。
+
+相关入口：
+
+```bash
+python run_timing_comparison.py
+python run_backtest_with_costs.py
+```
+
+## 另类数据研究：独立研究线
+
+- `Media15 / XHS / 百度指数` 是独立另类数据研究线。
+- 它们不进入主 alpha，不修改 Compact-F，不接入 Blend V3。
+- `media_neg_share_all` 可以作为 risk diagnostic filter（风险提示变量）或风险复核信号。
+- 原始 `XHS attention` 不应直接作为因子。
+- 百度指数更适合作为较弱的外部搜索关注对照。
+- 当前不声称这些变量已经形成可交易 alpha。
+- 可用于报告、履历、风险诊断，不作为当前 production promotion 条件。
+
+## 历史候选与模型治理
+
+以下材料用于研究追溯、面试叙事和方法论展示，不代表当前生产调参路线。
+
+### Compact-F
+
+- 从“当前唯一生产候选”降级为“历史生产候选 / 基本面对照模型”。
+- 历史 `Compact-F + Top50 Buffer 35/75` 仍保留其 Top50 Buffer 指标与治理价值。
+- 后续 v3 full panel tournament 显示 V0/V7 Blend 更适合作为当前 shadow candidate。
+- Compact-F 风格干净、可解释性强，但收益风险不及 v3 Blend。
+
+### V1/V2 Alpha Drift
+
+- V1/V2 Alpha Drift 保留为历史 RCA。
+- `V1->V2 Alpha Drift`、GS / colsample / BP / ProfitGrowth drift 等材料用于解释历史模型漂移。
+- 不作为当前主线调参路径。
+
+### Media15 / XHS / 百度
+
+- 保留为独立另类数据研究。
+- 不进入主 alpha。
+- 可用于报告、履历、风险诊断。
+
+代表性归档文件：
+
+- `output\ml_v7_final_report.md`
+- `output\V1_to_V2_alpha_drift_investigation_final.md`
+- `run_split_universe.py`
+- `run_ml_v7.py`
+- `run_model_comparison.py`
+
+## Roadmap
+
+### P0 当前已完成
+
+- V0/V7/Compact-F/Blend full panel tournament v3；
+- Blend V3 review gate；
+- Shadow live holdings；
+- 中文 dashboard；
+- 股票代码格式修复；
+- Shadow daily automation。
+
+### P1 当前进行中
+
+- shadow monitoring 观察 1-3 个月；
+- 每日检查 task result、NAV、可交易性；
+- 每周检查 shadow vs current paper trading；
+- 每月检查 Top50 Buffer 换手和持仓稳定性。
+
+### P2 后续候选
+
+- 将 shadow dashboard 合并进主 monitoring dashboard；
+- 执行层模拟：100 股整数手、涨跌停、停牌、滑点；
+- production promotion review；
+- CSMAR 数据层升级；
+- README 和 model registry 持续同步。
+
+### 暂停方向
+
+- 不继续调 Compact-FT / FT3；
+- 不继续技术因子堆叠；
+- 不把 Media15 / XHS / 百度接入主 alpha；
+- 不继续追求更高回测 Sharpe；
+- 不在 shadow 观察期频繁改模型。
+
+## 风险提示
+
+- v3 Sharpe 是历史 OOS 回测结果，不保证未来实盘表现。
+- 当前 Blend V3 是 shadow candidate，不是正式 production。
+- 当前不生成真实交易订单，不发送交易指令。
+- 需要 1-3 个月 shadow 观察后再评估是否晋升。
+- 需继续监控任务是否每日成功运行。
+- 需继续监控 NAV 是否更新。
+- 需继续监控缺失价格、ST、停牌、涨跌停。
+- 需继续监控流动性。
+- 需继续监控与当前 paper trading 差异。
+- 需继续监控单行业 / 单风格集中。
+- 需继续监控实际换手。
+
+## Quick Start
+
+1. 安装环境
+
+```bash
+pip install -r requirements.txt
+```
+
+2. 查看 Blend V3 shadow 状态
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check_blend_v3_shadow_daily_status.ps1
+```
+
+3. 打开 Blend V3 中文 shadow dashboard
+
+```powershell
+streamlit run monitoring\blend_v3_shadow_report.py
+```
+
+4. 手动运行 Blend V3 shadow update
+
+```powershell
+cmd /c scripts\run_blend_v3_shadow_live_update.bat
+```
+
+5. 纸交易 dry run / force rebalance
+
+```bash
+python paper_trading/paper_trading_pipeline.py --date 2026-06-30 --force-rebalance -v
+```
+
+6. 主监控看板
+
+```bash
+streamlit run monitoring/daily_report.py
+```
+
+7. 单元测试
+
+```bash
 pytest tests/ -v
 ```
 
-## 流水线架构
+说明：`run_ml_v7.py`、`run_split_universe.py`、`run_model_comparison.py` 不再属于 Quick Start 主流程，应视为历史研究归档入口。
 
-```
-Stage 1 (预取) ────→ Stage 2 (面板) ────→ Stage 3 (预处理) ────→ Stage 4 (分析)
-  日线+财务缓存      因子计算+PIT对齐    MAD→中性化→Z-score     IC+回测+因子合成
-```
-
-4 阶段断点续跑 — 中断后重跑自动从断点继续。状态文件 `.pipeline_state.json` 记录进度,
-中间产物 `output/panel.parquet` 和 `output/preprocessed.parquet` 使后续分析无需重新跑全流程。
-
-## Split-Universe 双模型系统
-
-### 核心思想
-
-全市场线性模型忽视了 A 股最核心的结构性差异 — **大市值的机构定价 vs 小市值的散户定价**。
-Split-Universe 按流通市值百分位将股票切分为大盘池 (Top 50%) 和小盘池 (Bottom 50%),
-各自独立评估因子、独立合成信号, 最后通过池内截面 Z-score 标准化对齐量纲并拼接。
-
-### 因子归属 (数据驱动, 非预设)
-
-| 归属 | 因子 | 经济解释 |
-|------|------|----------|
-| **大盘型** | Debt_Ratio, Net_Profit_Margin, Mom_1M | 杠杆/利润率是机构定价锚; 短期反转弱 |
-| | PriceDev_20D, VolChg_20D | 技术信号在低噪音环境中确定性强 |
-| **小盘型** | ProfitGrowth_YoY, RevGrowth_YoY | ★ 成长是小盘核心引擎 (IC_IR 0.47 vs 0.20) |
-| | BP, EP | 深度价值在小盘中同样有效 |
-| | Beta, Mom_12M_1M, Vol_60D | 长期趋势+低波策略在小盘中更显著 |
-
-## ML 实验链 (V0 → V7)
-
-| 版本 | 核心设计 | Label | Gap | Sharpe | MaxDD | TO | 结论 |
-|------|----------|:-----:|:---:|:------:|:-----:|:--:|------|
-| V0 | Linear IC_IR 加权 | 1M | 0M | **1.13** | −18% | 23.7% | ★ 最优 |
-| V2 | LambdaRank 排序学习 | 3M | 3M | — | — | — | 不收敛 |
-| V5 | TO-Aware L2 loss, λ=2.0 | 3M | 3M | 0.95 | −27% | 12.9% | 控换手有效, 回撤恶化 |
-| V6 | Label Blending + Time-Decay | 混合 | 3M | 0.96 | −27% | 13.4% | 无显著改善 |
-| V7 | TO-Aware + 1M label + 0M gap | 1M | 0M | 0.98 | −27% | 12.6% | 回撤未修复 |
-
-> **核心发现**: 3M gap 是结构性 MaxDD 根因 — 模型在 3 个月盲区内信号的预测力衰减严重。
-> 移除 gap 后回撤未修复 (V7 -27% vs V0 -18%), 说明 ML 模型的截面排序能力本身弱于
-> 线性 IC_IR 加权。
-
-## 因子库 (16 因子)
-
-| 类别 | 因子 | 全市场 IC_IR | 说明 |
-|------|------|:-----------:|------|
-| 估值 | EP | +0.443 | 盈利/价格 (Earnings Yield) |
-| | BP | +0.270 | 净资产/价格 (Book-to-Price) |
-| 质量 | Net_Profit_Margin | +0.333 | 销售净利率 |
-| | ROE | +0.314 | 净资产收益率 |
-| | Debt_Ratio | −0.053 | 资产负债率 (低负债→高收益) |
-| 成长 | ProfitGrowth_YoY | +0.343 | 净利润同比增速 |
-| | RevGrowth_YoY | +0.243 | 营业收入同比增速 |
-| 动量 | Mom_1M | −0.174 | 1 月动量 (A 股短期反转) |
-| | Mom_3M | −0.167 | 3 月动量 |
-| | Mom_6M | −0.033 | 6 月动量 |
-| | Mom_12M_1M | +0.052 | 12−1 月动量 (剔除短期反转) |
-| 波动 | Vol_20D | −0.244 | 20 日波动率 (低波→高收益) |
-| | Vol_60D | −0.234 | 60 日波动率 |
-| | Beta | −0.082 | 市场 Beta |
-| 技术 | VolChg_20D | +0.127 | 20 日成交量变化率 |
-| | PriceDev_20D | −0.064 | 20 日均线偏离 (均值回复) |
-
-## 交易成本模型
-
-分层成本 = 佣金 (2.5 bps) + 印花税 (5 bps) + 过户费 (0.1 bps) + Almgren-Chriss 市场冲击
-
-| 参数 | 大盘 | 小盘 | 说明 |
-|------|:---:|:---:|------|
-| Base Slippage | 5 bps | 15 bps | 小盘流动性折价 |
-| Impact γ (冲击弹性) | 0.50 | 0.65 | 小盘对交易量更敏感 |
-| Impact η (量价指数) | 1.0 | 1.5 | 小盘呈超线性冲击 |
-| 月均成本 (V0) | ~1.6 bps | ~4.3 bps | 大盘小盘 ~2.7× 成本差 |
-
-## 回测参数
-
-- **股票池**: 中证 800 成分股 (随机采样 300 只, seed=42)
-- **区间**: 2017.01 – 2024.12 (96 个月)
-- **频率**: 月度调仓, 月末取日线最后一日
-- **预处理**: MAD 3× 去极值 → 板块中性化 → Z-score 标准化
-- **行业分类**: 5 大板块 (沪市主板/深市主板/深市中小板/创业板/科创板)
-- **因子合成**: IC_IR 加权 + 符号翻转 + 去冗余 (|corr| > 0.7)
-- **分组回测**: 5 分位法, 做多 Top 20% / 做空 Bottom 20%
-
-## 关键工程决策
-
-| 问题 | 方案 | 理由 |
-|------|------|------|
-| 重复代码导致行数爆炸 | 指数去重 + panel 安全去重 | CSI 800 同一股票多交易所挂牌 |
-| 财务数据时间对齐 | `pd.merge_asof(direction='backward')` | PIT (Point-in-Time) 避免前视偏差 |
-| EastMoney 市值数据不可达 | `流通市值 ≈ 成交额/换手率` | 截面排名足够准确 |
-| 申万行业 API 不可达 | 5 大板块分类 (代码前缀) | 行业中性化的代理方案 |
-| 去极值 | MAD (中位数绝对偏差) | 不受极端值本身影响, 优于均值±3σ |
-| Split-Universe 信号量纲 | 池内 Z-score 后拼接 | 避免大盘得分天然高于小盘 |
-| ML 3M gap → 结构性回撤 | 移除 gap, 改用 1M label | V7 验证 gap 是 MaxDD 根因 |
-
-## 数据来源
-
-- [akshare](https://github.com/akfamily/akshare) — 开源 A 股数据接口 (Sina/EastMoney 双源日线, 同花顺财务)
-- [baostock](http://baostock.com) — PIT 财务数据 (pubDate 门控, 零前看偏差), 用于纸交易管线
-- 中证指数 — 成分股列表
-
-## License
-
-MIT
+</details>

@@ -19,11 +19,14 @@
 
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+from scipy.stats import ConstantInputWarning
+warnings.filterwarnings("ignore", category=ConstantInputWarning)
 
 # ─── 核心模块 ─────────────────────────────────────────
 from data.fetcher import Fetcher
@@ -498,8 +501,8 @@ def stage4_analyze(panel: pd.DataFrame) -> None:
                     f"MaxDD={perf['Max_Drawdown']:.1%}"
                 )
 
-            # 多因子合成 — IC_IR 加权 + 符号翻转 + 去冗余
-            print(f"\n多因子合成 (IC_IR 加权, 翻转负IC因子, 去冗余 |r|>0.7, {len(factor_z_cols)} 个因子)")
+            # 多因子合成 — Gram-Schmidt 正交化 + 滚动 IC_IR 加权
+            print(f"\n多因子合成 Gram-Schmidt 正交化 (滚动24月IC_IR, {len(factor_z_cols)} 个因子)")
             combined = combine_factors(
                 panel,
                 factor_cols=factor_z_cols,
